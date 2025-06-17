@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # GPU 컨테이너 오케스트레이터
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/orchestrator.Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/workspaces:/srv/workspaces
+      - ./sshpiper-config:/etc/sshpiper
+      - orchestrator-data:/data
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    depends_on:
+      - sshpiper
+    networks:
+      - management
+      - worknet
+    restart: unless-stopped
+
+  # SSH 게이트웨이
+  sshpiper:
+    build:
+      context: .
+      dockerfile: sshpiper.Dockerfile
+    container_name: sshpiper
+    ports:
+      - "22:22"
+    volumes:
+      - ./sshpiper-config:/etc/sshpiper
+    networks:
+      - management
+      - worknet
+    restart: unless-stopped
+
+  # 모니터링 (선택사항)
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - management
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - management
+    restart: unless-stopped
+
+networks:
+  management:
+    driver: bridge
+  worknet:
+    external: true
+    name: worknet
+
+volumes:
+  orchestrator-data:
+  grafana-data: 
