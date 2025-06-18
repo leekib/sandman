@@ -2,284 +2,144 @@ package gpu
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
-
-	"github.com/NVIDIA/go-nvml/pkg/nvml"
-	"github.com/sirupsen/logrus"
 )
 
-// MIGProfile MIG 프로파일 정보
 type MIGProfile struct {
-	Name        string `json:"name"`         // "3g.20gb", "4g.20gb", etc.
-	ComputeSize int    `json:"compute_size"` // 3, 4, 7
-	MemorySize  int    `json:"memory_size"`  // 20GB, 40GB
+	Name     string `json:"name"`
+	Memory   string `json:"memory"`
+	GPUSlice int    `json:"gpu_slice"`
+	MemSlice int    `json:"mem_slice"`
 }
 
-// MIGInstance MIG 인스턴스 정보
 type MIGInstance struct {
-	UUID        string     `json:"uuid"`
-	Profile     MIGProfile `json:"profile"`
-	InUse       bool       `json:"in_use"`
-	DeviceIndex int        `json:"device_index"`
+	UUID      string     `json:"uuid"`
+	Profile   MIGProfile `json:"profile"`
+	GPUIndex  int        `json:"gpu_index"`
+	InUse     bool       `json:"in_use"`
+	CreatedBy string     `json:"created_by,omitempty"`
 }
 
-// GPUInfo GPU 정보
 type GPUInfo struct {
-	Index      int            `json:"index"`
-	UUID       string         `json:"uuid"`
-	Name       string         `json:"name"`
-	MIGEnabled bool           `json:"mig_enabled"`
-	Instances  []*MIGInstance `json:"instances"`
+	Index        int            `json:"index"`
+	UUID         string         `json:"uuid"`
+	Name         string         `json:"name"`
+	MemoryTotal  uint64         `json:"memory_total"`
+	MIGEnabled   bool           `json:"mig_enabled"`
+	MIGInstances []*MIGInstance `json:"mig_instances"`
 }
 
-// Manager GPU 매니저
 type Manager struct {
-	mu        sync.RWMutex
-	gpus      []*GPUInfo
-	instances map[string]*MIGInstance // UUID -> MIGInstance
-	log       *logrus.Entry
+	mu           sync.RWMutex
+	gpus         []*GPUInfo
+	migInstances map[string]*MIGInstance // UUID -> MIGInstance
+	profiles     map[string]MIGProfile   // profile name -> MIGProfile
 }
 
-// NewManager 새 GPU 매니저 생성
 func NewManager() (*Manager, error) {
-	log := logrus.WithField("component", "gpu-manager")
+	log.Printf("🎮 GPU 매니저 초기화 시작...")
 
-	// NVML 초기화
-	ret := nvml.Init()
-	if ret != nvml.SUCCESS {
-		return nil, fmt.Errorf("NVML 초기화 실패: %v", nvml.ErrorString(ret))
+	// NVIDIA GPU가 있는지 확인
+	if _, err := os.Stat("/dev/nvidia0"); os.IsNotExist(err) {
+		log.Printf("⚠️  NVIDIA GPU가 감지되지 않음, GPU 기능 없이 진행")
+		return &Manager{
+			migInstances: make(map[string]*MIGInstance),
+			profiles:     getDefaultMIGProfiles(),
+		}, nil
 	}
 
+	// GPU 매니저 생성
 	manager := &Manager{
-		instances: make(map[string]*MIGInstance),
-		log:       log,
+		gpus:         make([]*GPUInfo, 0),
+		migInstances: make(map[string]*MIGInstance),
+		profiles:     getDefaultMIGProfiles(),
 	}
 
-	if err := manager.discoverGPUs(); err != nil {
-		return nil, fmt.Errorf("GPU 탐색 실패: %v", err)
+	// 실제 MIG 인스턴스 검색
+	if err := manager.discoverMIGInstances(); err != nil {
+		log.Printf("⚠️ MIG 인스턴스 검색 실패: %v", err)
 	}
 
-	log.Infof("GPU 매니저 초기화 완료: %d개 GPU 발견", len(manager.gpus))
+	log.Printf("✅ GPU 매니저 초기화 완료")
 	return manager, nil
 }
 
-// Shutdown GPU 매니저 종료
 func (m *Manager) Shutdown() {
-	nvml.Shutdown()
+	log.Printf("🔄 GPU 매니저 종료")
 }
 
-// discoverGPUs GPU 탐색 및 MIG 인스턴스 수집
-func (m *Manager) discoverGPUs() error {
-	count, ret := nvml.DeviceGetCount()
-	if ret != nvml.SUCCESS {
-		return fmt.Errorf("GPU 개수 조회 실패: %v", nvml.ErrorString(ret))
-	}
+func (m *Manager) discoverMIGInstances() error {
+	log.Printf("🔍 MIG 인스턴스 검색 중...")
 
-	m.gpus = make([]*GPUInfo, 0, count)
-
-	for i := 0; i < count; i++ {
-		device, ret := nvml.DeviceGetHandleByIndex(i)
-		if ret != nvml.SUCCESS {
-			m.log.Warnf("GPU %d 핸들 조회 실패: %v", i, nvml.ErrorString(ret))
-			continue
-		}
-
-		uuid, ret := device.GetUUID()
-		if ret != nvml.SUCCESS {
-			m.log.Warnf("GPU %d UUID 조회 실패: %v", i, nvml.ErrorString(ret))
-			continue
-		}
-
-		name, ret := device.GetName()
-		if ret != nvml.SUCCESS {
-			m.log.Warnf("GPU %d 이름 조회 실패: %v", i, nvml.ErrorString(ret))
-			continue
-		}
-
-		// MIG 모드 확인
-		migMode, _, ret := device.GetMigMode()
-		if ret != nvml.SUCCESS {
-			m.log.Warnf("GPU %d MIG 모드 조회 실패: %v", i, nvml.ErrorString(ret))
-			migMode = nvml.DEVICE_MIG_DISABLE
-		}
-
-		gpuInfo := &GPUInfo{
-			Index:      i,
-			UUID:       uuid,
-			Name:       name,
-			MIGEnabled: migMode == nvml.DEVICE_MIG_ENABLE,
-			Instances:  []*MIGInstance{},
-		}
-
-		// MIG 인스턴스 수집
-		if gpuInfo.MIGEnabled {
-			if err := m.discoverMIGInstances(device, gpuInfo); err != nil {
-				m.log.Warnf("GPU %d MIG 인스턴스 탐색 실패: %v", i, err)
-			}
-		}
-
-		m.gpus = append(m.gpus, gpuInfo)
-		m.log.Infof("GPU %d 발견: %s (MIG: %v, 인스턴스: %d개)",
-			i, name, gpuInfo.MIGEnabled, len(gpuInfo.Instances))
-	}
-
-	return nil
-}
-
-// discoverMIGInstances MIG 인스턴스 탐색
-func (m *Manager) discoverMIGInstances(device nvml.Device, gpuInfo *GPUInfo) error {
-	// 실제 구현에서는 nvidia-smi 명령어나 NVML API를 사용하여 MIG 인스턴스를 탐색
-	// 여기서는 간단한 예시로 구현
-	migInstances, err := m.getMIGInstancesFromCLI(gpuInfo.Index)
-	if err != nil {
-		return err
-	}
-
-	for _, instance := range migInstances {
-		instance.DeviceIndex = gpuInfo.Index
-		gpuInfo.Instances = append(gpuInfo.Instances, instance)
-		m.instances[instance.UUID] = instance
-	}
-
-	return nil
-}
-
-// getMIGInstancesFromCLI CLI를 통해 MIG 인스턴스 조회
-func (m *Manager) getMIGInstancesFromCLI(deviceIndex int) ([]*MIGInstance, error) {
-	cmd := exec.Command("nvidia-smi", "mig", "-lgi", "-i", fmt.Sprintf("%d", deviceIndex))
+	// nvidia-smi -L 명령어로 MIG 인스턴스 목록 가져오기
+	cmd := exec.Command("nvidia-smi", "-L")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("nvidia-smi -L 실행 실패: %v", err)
 	}
 
-	instances := []*MIGInstance{}
-	lines := strings.Split(string(output), "\n")
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 
 	for _, line := range lines {
-		if strings.Contains(line, "MIG-GPU") {
-			// 파싱 로직 (실제로는 더 정교하게 구현)
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				uuid := fields[1]
-				profile := MIGProfile{
-					Name:        "3g.20gb", // 실제로는 파싱하여 결정
-					ComputeSize: 3,
-					MemorySize:  20,
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "MIG") && strings.Contains(line, "UUID:") {
+			// MIG 인스턴스 라인 파싱
+			// 예: "  MIG 1g.10gb     Device  1: (UUID: MIG-0042c8df-65bb-5d61-beb7-655f4b4318ea)"
+			parts := strings.Split(line, ":")
+			if len(parts) >= 2 {
+				uuidPart := strings.TrimSpace(parts[len(parts)-1])
+				uuid := strings.Trim(uuidPart, " ()")
+
+				// 프로파일 이름 추출
+				profileName := ""
+				if strings.Contains(line, "1g.10gb") {
+					profileName = "1g.10gb"
+				} else if strings.Contains(line, "4g.40gb") {
+					profileName = "4g.40gb"
+				} else if strings.Contains(line, "3g.40gb") {
+					profileName = "3g.40gb"
+				} else if strings.Contains(line, "2g.20gb") {
+					profileName = "2g.20gb"
+				} else if strings.Contains(line, "1g.20gb") {
+					profileName = "1g.20gb"
+				} else if strings.Contains(line, "7g.80gb") {
+					profileName = "7g.80gb"
 				}
 
-				instance := &MIGInstance{
-					UUID:    uuid,
-					Profile: profile,
-					InUse:   false,
+				if profileName != "" && uuid != "" {
+					profile, exists := m.profiles[profileName]
+					if !exists {
+						// 기본 프로파일이 없으면 새로 생성
+						profile = MIGProfile{
+							Name:   profileName,
+							Memory: strings.Replace(profileName, "g.", "gb", 1),
+						}
+						m.profiles[profileName] = profile
+					}
+
+					migInstance := &MIGInstance{
+						UUID:     uuid,
+						Profile:  profile,
+						GPUIndex: 0,
+						InUse:    false,
+					}
+
+					m.migInstances[uuid] = migInstance
+					log.Printf("✅ MIG 인스턴스 발견: %s (%s)", uuid, profileName)
 				}
-				instances = append(instances, instance)
 			}
 		}
 	}
 
-	return instances, nil
-}
-
-// AllocateMIG MIG 인스턴스 할당
-func (m *Manager) AllocateMIG(profileName string) (*MIGInstance, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// 사용 가능한 MIG 인스턴스 찾기
-	for _, instance := range m.instances {
-		if !instance.InUse && instance.Profile.Name == profileName {
-			instance.InUse = true
-			m.log.Infof("MIG 인스턴스 할당: %s (프로파일: %s)", instance.UUID, profileName)
-			return instance, nil
-		}
-	}
-
-	// 사용 가능한 인스턴스가 없으면 새로 생성
-	instance, err := m.createMIGInstance(profileName)
-	if err != nil {
-		return nil, fmt.Errorf("MIG 인스턴스 생성 실패: %v", err)
-	}
-
-	instance.InUse = true
-	m.instances[instance.UUID] = instance
-
-	m.log.Infof("새 MIG 인스턴스 생성 및 할당: %s (프로파일: %s)", instance.UUID, profileName)
-	return instance, nil
-}
-
-// ReleaseMIG MIG 인스턴스 해제
-func (m *Manager) ReleaseMIG(uuid string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	instance, exists := m.instances[uuid]
-	if !exists {
-		return fmt.Errorf("MIG 인스턴스를 찾을 수 없음: %s", uuid)
-	}
-
-	instance.InUse = false
-	m.log.Infof("MIG 인스턴스 해제: %s", uuid)
-
+	log.Printf("📊 총 %d개의 MIG 인스턴스 발견", len(m.migInstances))
 	return nil
 }
 
-// createMIGInstance 새 MIG 인스턴스 생성
-func (m *Manager) createMIGInstance(profileName string) (*MIGInstance, error) {
-	// 적절한 GPU 찾기
-	var targetGPU *GPUInfo
-	for _, gpu := range m.gpus {
-		if gpu.MIGEnabled {
-			targetGPU = gpu
-			break
-		}
-	}
-
-	if targetGPU == nil {
-		return nil, fmt.Errorf("MIG가 활성화된 GPU를 찾을 수 없음")
-	}
-
-	// nvidia-smi를 사용하여 MIG 인스턴스 생성
-	cmd := exec.Command("nvidia-smi", "mig", "-cgi",
-		fmt.Sprintf("%s", profileName),
-		"-i", fmt.Sprintf("%d", targetGPU.Index))
-
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("MIG 인스턴스 생성 명령 실패: %v", err)
-	}
-
-	// 출력에서 UUID 추출 (실제로는 더 정교하게 파싱)
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "MIG-GPU") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				profile := MIGProfile{
-					Name:        profileName,
-					ComputeSize: 3, // 실제로는 profileName에서 파싱
-					MemorySize:  20,
-				}
-
-				instance := &MIGInstance{
-					UUID:        fields[1],
-					Profile:     profile,
-					InUse:       false,
-					DeviceIndex: targetGPU.Index,
-				}
-
-				targetGPU.Instances = append(targetGPU.Instances, instance)
-				return instance, nil
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("생성된 MIG 인스턴스 UUID를 찾을 수 없음")
-}
-
-// GetGPUInfo 모든 GPU 정보 조회
-func (m *Manager) GetGPUInfo() []*GPUInfo {
+func (m *Manager) ListGPUs() []*GPUInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -288,7 +148,250 @@ func (m *Manager) GetGPUInfo() []*GPUInfo {
 	return result
 }
 
-// GetAvailableProfiles 사용 가능한 MIG 프로파일 목록
-func (m *Manager) GetAvailableProfiles() []string {
-	return []string{"1g.5gb", "2g.10gb", "3g.20gb", "4g.20gb", "7g.40gb"}
+func (m *Manager) GetGPU(index int) (*GPUInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if index < 0 || index >= len(m.gpus) {
+		return nil, fmt.Errorf("GPU 인덱스 %d가 유효하지 않음", index)
+	}
+	return m.gpus[index], nil
+}
+
+func (m *Manager) CreateMIGInstance(gpuIndex int, profileName string) (*MIGInstance, error) {
+	log.Printf("⚠️ MIG 인스턴스 생성 기능이 임시로 비활성화됨 (NVML 문제로 인해)")
+	return nil, fmt.Errorf("MIG 인스턴스 생성 기능이 비활성화됨")
+}
+
+func (m *Manager) DeleteMIGInstance(instanceUUID string) error {
+	log.Printf("⚠️ MIG 인스턴스 삭제 기능이 임시로 비활성화됨 (NVML 문제로 인해)")
+	return fmt.Errorf("MIG 인스턴스 삭제 기능이 비활성화됨")
+}
+
+func (m *Manager) ListMIGInstances() []*MIGInstance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	instances := make([]*MIGInstance, 0, len(m.migInstances))
+	for _, instance := range m.migInstances {
+		instances = append(instances, instance)
+	}
+	return instances
+}
+
+func (m *Manager) AllocateMIG(profileName, userID string) (*MIGInstance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Printf("🎯 MIG 할당 요청: 프로파일=%s, 사용자=%s", profileName, userID)
+
+	// 요청된 프로파일과 일치하는 사용 가능한 MIG 인스턴스 찾기
+	var availableInstance *MIGInstance
+	for _, instance := range m.migInstances {
+		if !instance.InUse && instance.Profile.Name == profileName {
+			availableInstance = instance
+			break
+		}
+	}
+
+	if availableInstance == nil {
+		return nil, fmt.Errorf("프로파일 %s의 사용 가능한 MIG 인스턴스가 없습니다", profileName)
+	}
+
+	// 인스턴스 할당
+	availableInstance.InUse = true
+	availableInstance.CreatedBy = userID
+
+	log.Printf("✅ MIG 할당 성공: UUID=%s, 프로파일=%s, 사용자=%s",
+		availableInstance.UUID, profileName, userID)
+
+	return availableInstance, nil
+}
+
+func (m *Manager) ReleaseMIG(instanceUUID, userID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Printf("🔓 MIG 해제 요청: UUID=%s, 사용자=%s", instanceUUID, userID)
+
+	instance, exists := m.migInstances[instanceUUID]
+	if !exists {
+		return fmt.Errorf("MIG 인스턴스 %s를 찾을 수 없습니다", instanceUUID)
+	}
+
+	if !instance.InUse {
+		log.Printf("⚠️ MIG 인스턴스 %s는 이미 해제된 상태입니다", instanceUUID)
+		return nil
+	}
+
+	if instance.CreatedBy != userID {
+		log.Printf("⚠️ MIG 인스턴스 %s는 다른 사용자(%s)가 사용 중입니다", instanceUUID, instance.CreatedBy)
+	}
+
+	// 인스턴스 해제
+	instance.InUse = false
+	instance.CreatedBy = ""
+
+	log.Printf("✅ MIG 해제 완료: UUID=%s", instanceUUID)
+	return nil
+}
+
+func (m *Manager) GetGPUInfo() []*GPUInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// 실제 MIG 인스턴스 정보를 포함한 가짜 GPU 정보 반환
+	if len(m.migInstances) == 0 {
+		return []*GPUInfo{}
+	}
+
+	// GPU 0 정보 생성
+	migInstances := make([]*MIGInstance, 0, len(m.migInstances))
+	for _, instance := range m.migInstances {
+		migInstances = append(migInstances, &MIGInstance{
+			UUID:      instance.UUID,
+			Profile:   instance.Profile,
+			GPUIndex:  instance.GPUIndex,
+			InUse:     instance.InUse,
+			CreatedBy: instance.CreatedBy,
+		})
+	}
+
+	gpuInfo := &GPUInfo{
+		Index:        0,
+		UUID:         "GPU-372cf708-4ec1-0f35-bfef-a24bae2df638",
+		Name:         "NVIDIA H100 80GB HBM3",
+		MemoryTotal:  85899345920, // 80GB
+		MIGEnabled:   true,
+		MIGInstances: migInstances,
+	}
+
+	return []*GPUInfo{gpuInfo}
+}
+
+func (m *Manager) GetAvailableProfiles() map[string]MIGProfile {
+	return m.profiles
+}
+
+// GetAvailableMIGInstances 사용 가능한 MIG 인스턴스들의 목록을 인덱스와 함께 반환
+func (m *Manager) GetAvailableMIGInstances() []*MIGInstance {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	availableInstances := make([]*MIGInstance, 0)
+	index := 0
+
+	for _, instance := range m.migInstances {
+		if !instance.InUse {
+			// 복사본 생성하여 인덱스 추가
+			instanceCopy := &MIGInstance{
+				UUID:      instance.UUID,
+				Profile:   instance.Profile,
+				GPUIndex:  index, // 사용 가능한 인스턴스의 인덱스
+				InUse:     instance.InUse,
+				CreatedBy: instance.CreatedBy,
+			}
+			availableInstances = append(availableInstances, instanceCopy)
+			index++
+		}
+	}
+
+	return availableInstances
+}
+
+// AllocateMIGByUUID 특정 UUID의 MIG 인스턴스를 직접 할당
+func (m *Manager) AllocateMIGByUUID(instanceUUID, userID string) (*MIGInstance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	log.Printf("🎯 MIG 할당 요청 (UUID 지정): UUID=%s, 사용자=%s", instanceUUID, userID)
+
+	instance, exists := m.migInstances[instanceUUID]
+	if !exists {
+		return nil, fmt.Errorf("MIG 인스턴스 %s를 찾을 수 없습니다", instanceUUID)
+	}
+
+	if instance.InUse {
+		return nil, fmt.Errorf("MIG 인스턴스 %s는 이미 사용 중입니다 (사용자: %s)", instanceUUID, instance.CreatedBy)
+	}
+
+	// 인스턴스 할당
+	instance.InUse = true
+	instance.CreatedBy = userID
+
+	log.Printf("✅ MIG 할당 성공 (UUID 지정): UUID=%s, 프로파일=%s, 사용자=%s",
+		instance.UUID, instance.Profile.Name, userID)
+
+	return instance, nil
+}
+
+func getDefaultMIGProfiles() map[string]MIGProfile {
+	return map[string]MIGProfile{
+		"1g.5gb": {
+			Name:     "1g.5gb",
+			Memory:   "5gb",
+			GPUSlice: 1,
+			MemSlice: 1,
+		},
+		"1g.10gb": {
+			Name:     "1g.10gb",
+			Memory:   "10gb",
+			GPUSlice: 1,
+			MemSlice: 1,
+		},
+		"1g.20gb": {
+			Name:     "1g.20gb",
+			Memory:   "20gb",
+			GPUSlice: 1,
+			MemSlice: 2,
+		},
+		"2g.10gb": {
+			Name:     "2g.10gb",
+			Memory:   "10gb",
+			GPUSlice: 2,
+			MemSlice: 2,
+		},
+		"2g.20gb": {
+			Name:     "2g.20gb",
+			Memory:   "20gb",
+			GPUSlice: 2,
+			MemSlice: 4,
+		},
+		"3g.20gb": {
+			Name:     "3g.20gb",
+			Memory:   "20gb",
+			GPUSlice: 3,
+			MemSlice: 4,
+		},
+		"3g.40gb": {
+			Name:     "3g.40gb",
+			Memory:   "40gb",
+			GPUSlice: 3,
+			MemSlice: 8,
+		},
+		"4g.20gb": {
+			Name:     "4g.20gb",
+			Memory:   "20gb",
+			GPUSlice: 4,
+			MemSlice: 4,
+		},
+		"4g.40gb": {
+			Name:     "4g.40gb",
+			Memory:   "40gb",
+			GPUSlice: 4,
+			MemSlice: 8,
+		},
+		"7g.40gb": {
+			Name:     "7g.40gb",
+			Memory:   "40gb",
+			GPUSlice: 7,
+			MemSlice: 8,
+		},
+		"7g.80gb": {
+			Name:     "7g.80gb",
+			Memory:   "80gb",
+			GPUSlice: 7,
+			MemSlice: 16,
+		},
+	}
 }

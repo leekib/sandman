@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  orchestrator:
+    build: .
+    container_name: gpu-ssh-orchestrator
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /srv/workspaces:/srv/workspaces
+      - /var/lib/orchestrator:/var/lib/orchestrator
+      - /etc/sshpiper:/etc/sshpiper
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    runtime: nvidia
+    networks:
+      - worknet
+    restart: unless-stopped
+
+  sshpiper:
+    image: farmer1992/sshpiperd:latest
+    container_name: sshpiper
+    ports:
+      - "10022:2222"
+    volumes:
+      - /etc/sshpiper:/etc/sshpiper
+    networks:
+      - worknet
+    restart: unless-stopped
+    depends_on:
+      - orchestrator
+
+networks:
+  worknet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.100.0.0/16
+          gateway: 10.100.0.1
+
+volumes:
+  orchestrator_data:
+  sshpiper_config: 

@@ -2,185 +2,223 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Session 세션 정보 구조체
 type Session struct {
-	ID          string    `json:"id"`
-	UserID      string    `json:"user_id"`
-	ContainerID string    `json:"container_id"`
-	GPUUUID     string    `json:"gpu_uuid"`
-	ContainerIP string    `json:"container_ip"`
-	CreatedAt   time.Time `json:"created_at"`
-	TTL         int       `json:"ttl_minutes"`
-	Status      string    `json:"status"` // "running", "stopped", "failed"
+	ID          string            `json:"id"`
+	UserID      string            `json:"user_id"`
+	ContainerID string            `json:"container_id"`
+	ContainerIP string            `json:"container_ip"`
+	GPUUUID     string            `json:"gpu_uuid"`
+	MIGProfile  string            `json:"mig_profile"`
+	TTLMinutes  int               `json:"ttl_minutes"`
+	CreatedAt   time.Time         `json:"created_at"`
+	ExpiresAt   time.Time         `json:"expires_at"`
+	Metadata    map[string]string `json:"metadata"`
 }
 
-// Store 데이터베이스 스토어
-type Store struct {
+type Store interface {
+	CreateSession(session *Session) error
+	GetSession(id string) (*Session, error)
+	GetSessionByUserID(userID string) (*Session, error)
+	UpdateSession(session *Session) error
+	DeleteSession(id string) error
+	ListExpiredSessions() ([]*Session, error)
+	ListAllSessions() ([]*Session, error)
+	Close() error
+}
+
+type SQLiteStore struct {
 	db *sql.DB
 }
 
-// New 새로운 스토어 인스턴스 생성
-func New(dbPath string) (*Store, error) {
+func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, err
 	}
 
-	store := &Store{db: db}
-	if err := store.initTables(); err != nil {
+	store := &SQLiteStore{db: db}
+	if err := store.migrate(); err != nil {
 		return nil, err
 	}
 
 	return store, nil
 }
 
-// Close 데이터베이스 연결 종료
-func (s *Store) Close() error {
-	return s.db.Close()
-}
-
-// initTables 테이블 초기화
-func (s *Store) initTables() error {
+func (s *SQLiteStore) migrate() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS sessions (
 		id TEXT PRIMARY KEY,
-		user_id TEXT NOT NULL,
-		container_id TEXT,
+		user_id TEXT NOT NULL UNIQUE,
+		container_id TEXT NOT NULL,
+		container_ip TEXT NOT NULL,
 		gpu_uuid TEXT,
-		container_ip TEXT,
-		created_at DATETIME NOT NULL,
+		mig_profile TEXT,
 		ttl_minutes INTEGER NOT NULL,
-		status TEXT NOT NULL DEFAULT 'running'
+		created_at DATETIME NOT NULL,
+		expires_at DATETIME NOT NULL,
+		metadata TEXT
 	);
-	
-	CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-	CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
-	CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at);
-	`
 
+	CREATE INDEX IF NOT EXISTS idx_user_id ON sessions(user_id);
+	CREATE INDEX IF NOT EXISTS idx_expires_at ON sessions(expires_at);
+	`
 	_, err := s.db.Exec(query)
 	return err
 }
 
-// CreateSession 새 세션 생성
-func (s *Store) CreateSession(session *Session) error {
+func (s *SQLiteStore) CreateSession(session *Session) error {
+	metadataJSON, _ := json.Marshal(session.Metadata)
+	
 	query := `
-	INSERT INTO sessions (id, user_id, container_id, gpu_uuid, container_ip, created_at, ttl_minutes, status)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO sessions (id, user_id, container_id, container_ip, gpu_uuid, mig_profile, ttl_minutes, created_at, expires_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
-
-	_, err := s.db.Exec(query, session.ID, session.UserID, session.ContainerID,
-		session.GPUUUID, session.ContainerIP, session.CreatedAt, session.TTL, session.Status)
+	_, err := s.db.Exec(query, 
+		session.ID, session.UserID, session.ContainerID, session.ContainerIP,
+		session.GPUUUID, session.MIGProfile, session.TTLMinutes,
+		session.CreatedAt, session.ExpiresAt, string(metadataJSON))
+	
 	return err
 }
 
-// GetSession 세션 ID로 세션 조회
-func (s *Store) GetSession(id string) (*Session, error) {
-	query := `SELECT id, user_id, container_id, gpu_uuid, container_ip, created_at, ttl_minutes, status FROM sessions WHERE id = ?`
-
-	row := s.db.QueryRow(query, id)
-	session := &Session{}
-
-	err := row.Scan(&session.ID, &session.UserID, &session.ContainerID,
-		&session.GPUUUID, &session.ContainerIP, &session.CreatedAt, &session.TTL, &session.Status)
-	if err != nil {
-		return nil, err
-	}
-
-	return session, nil
-}
-
-// GetSessionByUserID 사용자 ID로 활성 세션 조회
-func (s *Store) GetSessionByUserID(userID string) (*Session, error) {
-	query := `SELECT id, user_id, container_id, gpu_uuid, container_ip, created_at, ttl_minutes, status 
-	FROM sessions WHERE user_id = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1`
-
-	row := s.db.QueryRow(query, userID)
-	session := &Session{}
-
-	err := row.Scan(&session.ID, &session.UserID, &session.ContainerID,
-		&session.GPUUUID, &session.ContainerIP, &session.CreatedAt, &session.TTL, &session.Status)
-	if err != nil {
-		return nil, err
-	}
-
-	return session, nil
-}
-
-// UpdateSession 세션 업데이트
-func (s *Store) UpdateSession(session *Session) error {
+func (s *SQLiteStore) GetSession(id string) (*Session, error) {
 	query := `
-	UPDATE sessions SET container_id = ?, gpu_uuid = ?, container_ip = ?, status = ?
-	WHERE id = ?
+		SELECT id, user_id, container_id, container_ip, gpu_uuid, mig_profile, ttl_minutes, created_at, expires_at, metadata
+		FROM sessions WHERE id = ?
 	`
+	
+	session := &Session{}
+	var metadataJSON string
+	
+	err := s.db.QueryRow(query, id).Scan(
+		&session.ID, &session.UserID, &session.ContainerID, &session.ContainerIP,
+		&session.GPUUUID, &session.MIGProfile, &session.TTLMinutes,
+		&session.CreatedAt, &session.ExpiresAt, &metadataJSON)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	json.Unmarshal([]byte(metadataJSON), &session.Metadata)
+	return session, nil
+}
 
-	_, err := s.db.Exec(query, session.ContainerID, session.GPUUUID, session.ContainerIP, session.Status, session.ID)
+func (s *SQLiteStore) GetSessionByUserID(userID string) (*Session, error) {
+	query := `
+		SELECT id, user_id, container_id, container_ip, gpu_uuid, mig_profile, ttl_minutes, created_at, expires_at, metadata
+		FROM sessions WHERE user_id = ?
+	`
+	
+	session := &Session{}
+	var metadataJSON string
+	
+	err := s.db.QueryRow(query, userID).Scan(
+		&session.ID, &session.UserID, &session.ContainerID, &session.ContainerIP,
+		&session.GPUUUID, &session.MIGProfile, &session.TTLMinutes,
+		&session.CreatedAt, &session.ExpiresAt, &metadataJSON)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	json.Unmarshal([]byte(metadataJSON), &session.Metadata)
+	return session, nil
+}
+
+func (s *SQLiteStore) UpdateSession(session *Session) error {
+	metadataJSON, _ := json.Marshal(session.Metadata)
+	
+	query := `
+		UPDATE sessions SET 
+			container_id = ?, container_ip = ?, gpu_uuid = ?, mig_profile = ?,
+			ttl_minutes = ?, expires_at = ?, metadata = ?
+		WHERE id = ?
+	`
+	_, err := s.db.Exec(query,
+		session.ContainerID, session.ContainerIP, session.GPUUUID, session.MIGProfile,
+		session.TTLMinutes, session.ExpiresAt, string(metadataJSON), session.ID)
+	
 	return err
 }
 
-// DeleteSession 세션 삭제
-func (s *Store) DeleteSession(id string) error {
+func (s *SQLiteStore) DeleteSession(id string) error {
 	query := `DELETE FROM sessions WHERE id = ?`
 	_, err := s.db.Exec(query, id)
 	return err
 }
 
-// GetExpiredSessions TTL이 만료된 세션들 조회
-func (s *Store) GetExpiredSessions() ([]*Session, error) {
+func (s *SQLiteStore) ListExpiredSessions() ([]*Session, error) {
 	query := `
-	SELECT id, user_id, container_id, gpu_uuid, container_ip, created_at, ttl_minutes, status
-	FROM sessions 
-	WHERE status = 'running' AND datetime(created_at, '+' || ttl_minutes || ' minutes') < datetime('now')
+		SELECT id, user_id, container_id, container_ip, gpu_uuid, mig_profile, ttl_minutes, created_at, expires_at, metadata
+		FROM sessions WHERE expires_at < datetime('now')
 	`
-
+	
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
+	
 	var sessions []*Session
 	for rows.Next() {
 		session := &Session{}
-		err := rows.Scan(&session.ID, &session.UserID, &session.ContainerID,
-			&session.GPUUUID, &session.ContainerIP, &session.CreatedAt, &session.TTL, &session.Status)
+		var metadataJSON string
+		
+		err := rows.Scan(
+			&session.ID, &session.UserID, &session.ContainerID, &session.ContainerIP,
+			&session.GPUUUID, &session.MIGProfile, &session.TTLMinutes,
+			&session.CreatedAt, &session.ExpiresAt, &metadataJSON)
+		
 		if err != nil {
-			return nil, err
+			continue
 		}
+		
+		json.Unmarshal([]byte(metadataJSON), &session.Metadata)
 		sessions = append(sessions, session)
 	}
-
+	
 	return sessions, nil
 }
 
-// GetAllSessions 모든 세션 조회
-func (s *Store) GetAllSessions() ([]*Session, error) {
+func (s *SQLiteStore) ListAllSessions() ([]*Session, error) {
 	query := `
-	SELECT id, user_id, container_id, gpu_uuid, container_ip, created_at, ttl_minutes, status
-	FROM sessions ORDER BY created_at DESC
+		SELECT id, user_id, container_id, container_ip, gpu_uuid, mig_profile, ttl_minutes, created_at, expires_at, metadata
+		FROM sessions ORDER BY created_at DESC
 	`
-
+	
 	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
+	
 	var sessions []*Session
 	for rows.Next() {
 		session := &Session{}
-		err := rows.Scan(&session.ID, &session.UserID, &session.ContainerID,
-			&session.GPUUUID, &session.ContainerIP, &session.CreatedAt, &session.TTL, &session.Status)
+		var metadataJSON string
+		
+		err := rows.Scan(
+			&session.ID, &session.UserID, &session.ContainerID, &session.ContainerIP,
+			&session.GPUUUID, &session.MIGProfile, &session.TTLMinutes,
+			&session.CreatedAt, &session.ExpiresAt, &metadataJSON)
+		
 		if err != nil {
-			return nil, err
+			continue
 		}
+		
+		json.Unmarshal([]byte(metadataJSON), &session.Metadata)
 		sessions = append(sessions, session)
 	}
-
+	
 	return sessions, nil
 }
+
+func (s *SQLiteStore) Close() error {
+	return s.db.Close()
+} 

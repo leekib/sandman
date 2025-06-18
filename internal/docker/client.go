@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,156 +17,153 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
-	"github.com/sirupsen/logrus"
 )
 
-const (
-	WorknetName   = "worknet"
-	WorknetSubnet = "172.30.0.0/16"
-	BaseImage     = "ubuntu:24.04"
-)
-
-// ContainerConfig 컨테이너 생성 설정
-type ContainerConfig struct {
-	UserID       string
-	GPUUUID      string
-	WorkspaceDir string
-	SSHPassword  string
-}
-
-// ContainerInfo 컨테이너 정보
-type ContainerInfo struct {
-	ID      string `json:"id"`
-	IP      string `json:"ip"`
-	Status  string `json:"status"`
-	UserID  string `json:"user_id"`
-	GPUUUID string `json:"gpu_uuid"`
-}
-
-// Client Docker 클라이언트
 type Client struct {
 	cli *client.Client
-	log *logrus.Entry
 }
 
-// NewClient 새 Docker 클라이언트 생성
+type ContainerConfig struct {
+	UserID        string
+	GPUUUID       string
+	WorkspaceDir  string
+	SSHPassword   string
+	SSHPrivateKey string
+	Image         string
+	NetworkName   string
+}
+
+type ContainerInfo struct {
+	ID            string `json:"id"`
+	IP            string `json:"ip"`
+	Image         string `json:"image"`
+	Status        string `json:"status"`
+	Created       string `json:"created"`
+	SSHPrivateKey string `json:"ssh_private_key"`
+}
+
+const (
+	DefaultImage       = "gpu-workspace"
+	DefaultNetworkName = "sandman_worknet"
+	NetworkSubnet      = "10.100.0.0/16"
+	IPRangeStart       = 100 // 10.100.0.100부터 시작
+	IPRangeEnd         = 254 // 10.100.0.254까지
+)
+
 func NewClient() (*Client, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("Docker 클라이언트 생성 실패: %v", err)
 	}
 
-	dockerClient := &Client{
-		cli: cli,
-		log: logrus.WithField("component", "docker-client"),
+	dockerClient := &Client{cli: cli}
+
+	// 네트워크 초기화
+	if err := dockerClient.ensureNetwork(); err != nil {
+		return nil, fmt.Errorf("네트워크 초기화 실패: %v", err)
 	}
 
-	// worknet 네트워크 초기화
-	if err := dockerClient.ensureWorknet(); err != nil {
-		return nil, fmt.Errorf("worknet 네트워크 초기화 실패: %v", err)
-	}
-
-	dockerClient.log.Info("Docker 클라이언트 초기화 완료")
+	log.Println("✅ Docker 클라이언트 초기화 완료")
 	return dockerClient, nil
 }
 
-// Close Docker 클라이언트 종료
 func (c *Client) Close() error {
 	return c.cli.Close()
 }
 
-// ensureWorknet worknet 네트워크 확인 및 생성
-func (c *Client) ensureWorknet() error {
+func (c *Client) ensureNetwork() error {
 	ctx := context.Background()
 
-	// 기존 네트워크 확인
+	// 네트워크 존재 여부 확인
 	networks, err := c.cli.NetworkList(ctx, types.NetworkListOptions{})
 	if err != nil {
 		return err
 	}
 
-	for _, network := range networks {
-		if network.Name == WorknetName {
-			c.log.Infof("worknet 네트워크 이미 존재: %s", network.ID[:12])
+	for _, net := range networks {
+		if net.Name == DefaultNetworkName {
+			log.Printf("🌐 기존 네트워크 사용: %s", DefaultNetworkName)
 			return nil
 		}
 	}
 
-	// 새 네트워크 생성
-	_, err = c.cli.NetworkCreate(ctx, WorknetName, types.NetworkCreate{
+	// 네트워크 생성
+	_, err = c.cli.NetworkCreate(ctx, DefaultNetworkName, types.NetworkCreate{
 		Driver: "bridge",
 		IPAM: &network.IPAM{
 			Config: []network.IPAMConfig{
 				{
-					Subnet: WorknetSubnet,
+					Subnet: NetworkSubnet,
 				},
 			},
+		},
+		Options: map[string]string{
+			"com.docker.network.bridge.name": DefaultNetworkName,
 		},
 	})
 
 	if err != nil {
-		return err
+		return fmt.Errorf("네트워크 생성 실패: %v", err)
 	}
 
-	c.log.Infof("worknet 네트워크 생성 완료: %s", WorknetSubnet)
+	log.Printf("🌐 새 네트워크 생성: %s (%s)", DefaultNetworkName, NetworkSubnet)
 	return nil
 }
 
-// CreateContainer GPU 컨테이너 생성
-func (c *Client) CreateContainer(config *ContainerConfig) (*ContainerInfo, error) {
+func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error) {
 	ctx := context.Background()
 
-	// 워크스페이스 디렉토리 확인
-	workspaceDir := fmt.Sprintf("/srv/workspaces/%s", config.UserID)
-	if config.WorkspaceDir != "" {
-		workspaceDir = config.WorkspaceDir
+	// 이미지 준비
+	image := config.Image
+	if image == "" {
+		image = DefaultImage
 	}
 
-	// 컨테이너 IP 할당
-	containerIP := c.allocateIP()
-
-	// SSH 패스워드 생성
-	sshPassword := config.SSHPassword
-	if sshPassword == "" {
-		sshPassword = c.generatePassword()
+	if err := c.pullImageIfNotExists(ctx, image); err != nil {
+		return nil, fmt.Errorf("이미지 준비 실패: %v", err)
 	}
 
-	// 환경 변수 설정
-	env := []string{
-		fmt.Sprintf("NVIDIA_VISIBLE_DEVICES=%s", config.GPUUUID),
-		fmt.Sprintf("SSH_PASSWORD=%s", sshPassword),
-		"DEBIAN_FRONTEND=noninteractive",
+	// 워크스페이스 디렉토리 생성
+	if err := c.ensureWorkspaceDir(config.WorkspaceDir); err != nil {
+		return nil, fmt.Errorf("워크스페이스 디렉토리 생성 실패: %v", err)
 	}
 
-	// 포트 바인딩
-	exposedPorts := nat.PortSet{
-		"22/tcp": struct{}{},
+	// 사용 가능한 IP 찾기
+	ip, err := c.findAvailableIP()
+	if err != nil {
+		return nil, fmt.Errorf("사용 가능한 IP 찾기 실패: %v", err)
 	}
 
-	// 마운트 설정
-	mounts := []mount.Mount{
-		{
-			Type:   mount.TypeBind,
-			Source: workspaceDir,
-			Target: "/workspace",
-		},
+	// SSH 비밀번호 생성
+	if config.SSHPassword == "" {
+		config.SSHPassword = generateRandomPassword()
 	}
 
 	// 컨테이너 설정
 	containerConfig := &container.Config{
-		Image:        BaseImage,
-		Env:          env,
-		ExposedPorts: exposedPorts,
-		WorkingDir:   "/workspace",
-		Cmd: []string{
-			"/bin/bash", "-c",
-			c.getStartupScript(sshPassword),
+		Image: image,
+		Env: []string{
+			"NVIDIA_VISIBLE_DEVICES=" + config.GPUUUID,
+			"SSH_PASSWORD=" + config.SSHPassword,
+			"USER_ID=" + config.UserID,
 		},
+		ExposedPorts: nat.PortSet{
+			"22/tcp": struct{}{},
+		},
+		Cmd:        []string{"/start.sh"},
+		WorkingDir: "/workspace",
 	}
 
 	// 호스트 설정
 	hostConfig := &container.HostConfig{
-		Mounts: mounts,
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: config.WorkspaceDir,
+				Target: "/workspace",
+			},
+		},
+		NetworkMode: container.NetworkMode(DefaultNetworkName),
 		Resources: container.Resources{
 			DeviceRequests: []container.DeviceRequest{
 				{
@@ -172,178 +172,271 @@ func (c *Client) CreateContainer(config *ContainerConfig) (*ContainerInfo, error
 					Capabilities: [][]string{{"gpu"}},
 				},
 			},
+			PidsLimit: &[]int64{100}[0],
 		},
+		RestartPolicy: container.RestartPolicy{
+			Name: "no",
+		},
+		AutoRemove: true,
 		SecurityOpt: []string{
 			"no-new-privileges:true",
+			"apparmor:unconfined",
 		},
-		CapDrop: []string{"ALL"},
-		CapAdd:  []string{"SETGID", "SETUID"},
+		CapDrop:        []string{"ALL"},
+		CapAdd:         []string{"SETUID", "SETGID", "DAC_OVERRIDE"},
+		ReadonlyRootfs: false,
 	}
 
 	// 네트워크 설정
 	networkConfig := &network.NetworkingConfig{
 		EndpointsConfig: map[string]*network.EndpointSettings{
-			WorknetName: {
+			DefaultNetworkName: {
 				IPAMConfig: &network.EndpointIPAMConfig{
-					IPv4Address: containerIP,
+					IPv4Address: ip,
 				},
 			},
 		},
 	}
 
 	// 컨테이너 생성
-	containerName := fmt.Sprintf("session-%s", config.UserID)
-	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, networkConfig, nil, containerName)
+	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, networkConfig, nil, config.UserID+"-container")
 	if err != nil {
 		return nil, fmt.Errorf("컨테이너 생성 실패: %v", err)
 	}
 
 	// 컨테이너 시작
 	if err := c.cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		// 실패 시 컨테이너 정리
-		c.cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 		return nil, fmt.Errorf("컨테이너 시작 실패: %v", err)
 	}
 
-	c.log.Infof("컨테이너 생성 완료: %s (IP: %s, GPU: %s)", resp.ID[:12], containerIP, config.GPUUUID)
+	// 컨테이너가 준비될 때까지 잠시 대기
+	log.Printf("⏳ 컨테이너 시작 대기 중: %s", resp.ID[:12])
+	time.Sleep(3 * time.Second)
+
+	// SSH 키 추출
+	log.Printf("🔍 SSH 키 추출 함수 호출 시작: %s", config.UserID)
+	privateKey, err := c.extractSSHPrivateKey(resp.ID, config.UserID)
+	if err != nil {
+		log.Printf("⚠️ SSH 키 추출 실패: %v", err)
+		// SSH 키 추출 실패해도 세션 생성은 계속 진행
+	} else {
+		log.Printf("✅ SSH 키 추출 완료: %s (길이: %d)", config.UserID, len(privateKey))
+	}
+
+	log.Printf("🐳 컨테이너 생성됨: %s (IP: %s, GPU: %s)", resp.ID[:12], ip, config.GPUUUID)
 
 	return &ContainerInfo{
-		ID:      resp.ID,
-		IP:      containerIP,
-		Status:  "running",
-		UserID:  config.UserID,
-		GPUUUID: config.GPUUUID,
+		ID:            resp.ID,
+		IP:            ip,
+		Image:         image,
+		Status:        "created",
+		Created:       time.Now().Format(time.RFC3339),
+		SSHPrivateKey: privateKey,
 	}, nil
 }
 
-// getStartupScript 컨테이너 시작 스크립트 생성
-func (c *Client) getStartupScript(password string) string {
-	return fmt.Sprintf(`
-# 패키지 업데이트 및 SSH 서버 설치
-apt-get update && apt-get install -y openssh-server sudo
-
-# SSH 설정
-mkdir -p /var/run/sshd
-echo 'root:%s' | chpasswd
-echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
-
-# SSH 키 생성
-ssh-keygen -A
-
-# 워크스페이스 권한 설정
-chmod 755 /workspace
-
-# SSH 데몬 시작
-/usr/sbin/sshd -D
-`, password)
-}
-
-// StopContainer 컨테이너 중지
 func (c *Client) StopContainer(containerID string) error {
 	ctx := context.Background()
-	timeout := int(30) // 30초 타임아웃
 
-	if err := c.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
-		return fmt.Errorf("컨테이너 중지 실패: %v", err)
+	timeoutSeconds := 10
+	err := c.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeoutSeconds})
+	if err != nil {
+		log.Printf("⚠️ 컨테이너 중지 실패 (강제 종료 시도): %v", err)
+		// 강제 종료 시도
+		return c.cli.ContainerKill(ctx, containerID, "SIGKILL")
 	}
 
-	c.log.Infof("컨테이너 중지 완료: %s", containerID[:12])
+	log.Printf("🛑 컨테이너 중지됨: %s", containerID[:12])
 	return nil
 }
 
-// RemoveContainer 컨테이너 삭제
 func (c *Client) RemoveContainer(containerID string) error {
 	ctx := context.Background()
 
-	if err := c.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
-		Force: true,
-	}); err != nil {
-		return fmt.Errorf("컨테이너 삭제 실패: %v", err)
+	err := c.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
+		Force:         true,
+		RemoveVolumes: true,
+	})
+
+	if err != nil {
+		return fmt.Errorf("컨테이너 제거 실패: %v", err)
 	}
 
-	c.log.Infof("컨테이너 삭제 완료: %s", containerID[:12])
+	log.Printf("🗑️ 컨테이너 제거됨: %s", containerID[:12])
 	return nil
 }
 
-// GetContainerInfo 컨테이너 정보 조회
 func (c *Client) GetContainerInfo(containerID string) (*ContainerInfo, error) {
 	ctx := context.Background()
 
-	inspection, err := c.cli.ContainerInspect(ctx, containerID)
+	inspect, err := c.cli.ContainerInspect(ctx, containerID)
 	if err != nil {
-		return nil, fmt.Errorf("컨테이너 정보 조회 실패: %v", err)
+		return nil, err
 	}
 
-	// IP 주소 추출
-	var containerIP string
-	if networks := inspection.NetworkSettings.Networks; networks != nil {
-		if worknet, exists := networks[WorknetName]; exists {
-			containerIP = worknet.IPAddress
-		}
-	}
-
-	// GPU UUID 추출
-	var gpuUUID string
-	for _, env := range inspection.Config.Env {
-		if strings.HasPrefix(env, "NVIDIA_VISIBLE_DEVICES=") {
-			gpuUUID = strings.TrimPrefix(env, "NVIDIA_VISIBLE_DEVICES=")
-			break
+	ip := ""
+	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Networks != nil {
+		if netInfo, exists := inspect.NetworkSettings.Networks[DefaultNetworkName]; exists {
+			ip = netInfo.IPAddress
 		}
 	}
 
 	return &ContainerInfo{
-		ID:      inspection.ID,
-		IP:      containerIP,
-		Status:  inspection.State.Status,
-		GPUUUID: gpuUUID,
+		ID:      inspect.ID,
+		IP:      ip,
+		Image:   inspect.Config.Image,
+		Status:  inspect.State.Status,
+		Created: inspect.Created,
 	}, nil
 }
 
-// allocateIP 사용 가능한 IP 주소 할당
-func (c *Client) allocateIP() string {
-	// 간단한 IP 할당 로직 (실제로는 더 정교하게 구현)
-	rand.Seed(time.Now().UnixNano())
-	return fmt.Sprintf("172.30.%d.%d", rand.Intn(254)+1, rand.Intn(254)+1)
-}
-
-// generatePassword 랜덤 패스워드 생성
-func (c *Client) generatePassword() string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	rand.Seed(time.Now().UnixNano())
-
-	password := make([]byte, 16)
-	for i := range password {
-		password[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(password)
-}
-
-// EnsureImage 필요한 이미지 확인 및 풀
-func (c *Client) EnsureImage(imageName string) error {
-	ctx := context.Background()
-
+func (c *Client) pullImageIfNotExists(ctx context.Context, image string) error {
 	// 이미지 존재 확인
-	_, _, err := c.cli.ImageInspectWithRaw(ctx, imageName)
+	_, _, err := c.cli.ImageInspectWithRaw(ctx, image)
 	if err == nil {
-		c.log.Infof("이미지 이미 존재: %s", imageName)
-		return nil
+		return nil // 이미지가 이미 존재
 	}
 
-	// 이미지 풀
-	c.log.Infof("이미지 다운로드 중: %s", imageName)
-	reader, err := c.cli.ImagePull(ctx, imageName, types.ImagePullOptions{})
+	log.Printf("📥 이미지 다운로드 중: %s", image)
+
+	reader, err := c.cli.ImagePull(ctx, image, types.ImagePullOptions{})
 	if err != nil {
-		return fmt.Errorf("이미지 풀 실패: %v", err)
+		return err
 	}
 	defer reader.Close()
 
-	// 출력 읽기 (다운로드 진행상황)
-	_, err = io.ReadAll(reader)
-	if err != nil {
-		return fmt.Errorf("이미지 풀 완료 실패: %v", err)
+	// Pull 진행 상황을 로그로 출력하지 않고 완료만 대기
+	_, err = io.Copy(io.Discard, reader)
+	return err
+}
+
+func (c *Client) ensureWorkspaceDir(path string) error {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return err
 	}
 
-	c.log.Infof("이미지 다운로드 완료: %s", imageName)
+	// 기본 파일들 생성
+	bashrcPath := filepath.Join(path, ".bashrc")
+	if _, err := os.Stat(bashrcPath); os.IsNotExist(err) {
+		bashrcContent := `# GPU SSH Gateway 워크스페이스
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+
+# GPU 정보 표시
+echo "🎮 할당된 GPU 정보:"
+nvidia-smi -L 2>/dev/null || echo "GPU 정보를 가져올 수 없습니다."
+echo "💾 워크스페이스: /workspace"
+echo "🔗 네트워크: ` + "`" + `hostname -I` + "`" + `"
+echo ""
+`
+		os.WriteFile(bashrcPath, []byte(bashrcContent), 0644)
+	}
+
 	return nil
+}
+
+func (c *Client) findAvailableIP() (string, error) {
+	ctx := context.Background()
+
+	// 사용 중인 IP 목록 수집
+	usedIPs := make(map[string]bool)
+
+	containers, err := c.cli.ContainerList(ctx, types.ContainerListOptions{
+		All: true,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	for _, container := range containers {
+		if container.NetworkSettings != nil && container.NetworkSettings.Networks != nil {
+			if netInfo, exists := container.NetworkSettings.Networks[DefaultNetworkName]; exists && netInfo.IPAddress != "" {
+				usedIPs[netInfo.IPAddress] = true
+			}
+		}
+	}
+
+	// 사용 가능한 IP 찾기
+	for i := IPRangeStart; i <= IPRangeEnd; i++ {
+		ip := fmt.Sprintf("10.100.0.%d", i)
+		if !usedIPs[ip] {
+			return ip, nil
+		}
+	}
+
+	return "", fmt.Errorf("사용 가능한 IP가 없습니다")
+}
+
+func generateRandomPassword() string {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 12)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func (c *Client) extractSSHPrivateKey(containerID, userID string) (string, error) {
+	ctx := context.Background()
+
+	// 컨테이너에서 SSH 개인키 파일 읽기
+	keyPath := fmt.Sprintf("/tmp/ssh_private_key_%s", userID)
+
+	log.Printf("🔍 SSH 키 추출 시작: %s (경로: %s)", userID, keyPath)
+
+	// 최대 30초 동안 SSH 키 생성을 기다림
+	for i := 0; i < 30; i++ {
+		cmd := []string{"cat", keyPath}
+
+		execConfig := types.ExecConfig{
+			Cmd:          cmd,
+			AttachStdout: true,
+			AttachStderr: true,
+		}
+
+		execIDResp, err := c.cli.ContainerExecCreate(ctx, containerID, execConfig)
+		if err != nil {
+			log.Printf("⚠️ SSH 키 추출 명령 생성 실패 (시도 %d/30): %v", i+1, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		resp, err := c.cli.ContainerExecAttach(ctx, execIDResp.ID, types.ExecStartCheck{})
+		if err != nil {
+			log.Printf("⚠️ SSH 키 추출 명령 실행 실패 (시도 %d/30): %v", i+1, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		defer resp.Close()
+
+		// 출력 읽기
+		output, err := io.ReadAll(resp.Reader)
+		if err != nil {
+			log.Printf("⚠️ SSH 키 출력 읽기 실패 (시도 %d/30): %v", i+1, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		privateKey := string(output)
+		log.Printf("🔍 SSH 키 내용 확인 (길이: %d)", len(privateKey))
+
+		// SSH 키 유효성 검증 - 더 포괄적인 조건
+		if len(privateKey) > 0 && (strings.Contains(privateKey, "BEGIN OPENSSH PRIVATE KEY") ||
+			strings.Contains(privateKey, "BEGIN RSA PRIVATE KEY") ||
+			strings.Contains(privateKey, "BEGIN EC PRIVATE KEY")) {
+			log.Printf("🔑 SSH 개인키 추출 성공: %s (길이: %d바이트)", userID, len(privateKey))
+			return privateKey, nil
+		}
+
+		if len(privateKey) > 0 {
+			log.Printf("⚠️ SSH 키 형식 불일치 (시도 %d/30): 길이=%d, 미리보기=%s", i+1, len(privateKey), privateKey[:min(50, len(privateKey))])
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Printf("❌ SSH 키 추출 시간 초과: %s", userID)
+	return "", fmt.Errorf("SSH 키 추출 시간 초과: %s", userID)
 }
