@@ -1,7 +1,3 @@
-Here's a more professional, English version of your document with a reduced number of emojis:
-
----
-
 # 🎯 Sandman: GPU SSH Gateway System
 
 Sandman is a system that enables administrators to provision user-specific containers with GPU MIG instances and persistent volumes via API. Users can then securely connect to these containers via SSH using a dedicated port (`ssh user123@host -p PORT`).
@@ -280,6 +276,3 @@ This project is licensed under the MIT License. See the `LICENSE` file for more 
 * Submit issues via GitHub
 * Contributions welcome via Pull Requests
 
----
-
-Let me know if you'd like a Markdown file or PDF version of this.
