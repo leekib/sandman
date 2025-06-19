@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/sandman/gpu-ssh-gateway/internal/docker"
 	"github.com/sandman/gpu-ssh-gateway/internal/gpu"
-	"github.com/sandman/gpu-ssh-gateway/internal/sshpiper"
 	"github.com/sandman/gpu-ssh-gateway/internal/store"
 )
 
@@ -37,7 +36,6 @@ type Service struct {
 	store         store.Store
 	dockerClient  *docker.Client
 	gpuManager    *gpu.Manager
-	piperManager  *sshpiper.Manager
 	workspaceRoot string
 }
 
@@ -45,14 +43,12 @@ func NewService(
 	store store.Store,
 	dockerClient *docker.Client,
 	gpuManager *gpu.Manager,
-	piperManager *sshpiper.Manager,
 	workspaceRoot string,
 ) *Service {
 	return &Service{
 		store:         store,
 		dockerClient:  dockerClient,
 		gpuManager:    gpuManager,
-		piperManager:  piperManager,
 		workspaceRoot: workspaceRoot,
 	}
 }
@@ -106,14 +102,6 @@ func (s *Service) CreateSession(req CreateRequest) (*CreateResponse, error) {
 		return nil, fmt.Errorf("컨테이너 생성 실패: %v", err)
 	}
 
-	// SSHPiper 라우팅 추가
-	if err := s.piperManager.AddRoute(req.UserID, containerInfo.IP); err != nil {
-		// 리소스 정리
-		s.dockerClient.RemoveContainer(containerInfo.ID)
-		s.gpuManager.ReleaseMIG(migInstance.UUID, req.UserID)
-		return nil, fmt.Errorf("SSH 라우팅 설정 실패: %v", err)
-	}
-
 	// 세션 정보 저장
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(req.TTLMinutes) * time.Minute)
@@ -123,6 +111,7 @@ func (s *Service) CreateSession(req CreateRequest) (*CreateResponse, error) {
 		UserID:      req.UserID,
 		ContainerID: containerInfo.ID,
 		ContainerIP: containerInfo.IP,
+		SSHPort:     containerInfo.SSHPort,
 		GPUUUID:     migInstance.UUID,
 		MIGProfile:  migInstance.Profile.Name, // 실제 할당된 프로파일 사용
 		TTLMinutes:  req.TTLMinutes,
@@ -132,25 +121,25 @@ func (s *Service) CreateSession(req CreateRequest) (*CreateResponse, error) {
 			"image":        containerInfo.Image,
 			"workspace":    workspaceDir,
 			"ssh_password": containerConfig.SSHPassword,
+			"ssh_port":     fmt.Sprintf("%d", containerInfo.SSHPort),
 		},
 	}
 
 	if err := s.store.CreateSession(session); err != nil {
 		// 리소스 정리
-		s.piperManager.RemoveRoute(req.UserID)
 		s.dockerClient.RemoveContainer(containerInfo.ID)
 		s.gpuManager.ReleaseMIG(migInstance.UUID, req.UserID)
 		return nil, fmt.Errorf("세션 저장 실패: %v", err)
 	}
 
-	log.Printf("✅ 세션 생성 완료: %s (사용자: %s, GPU: %s)", session.ID, req.UserID, migInstance.UUID)
+	log.Printf("✅ 세션 생성 완료: %s (사용자: %s, GPU: %s, SSH 포트: %d)", session.ID, req.UserID, migInstance.UUID, containerInfo.SSHPort)
 
 	return &CreateResponse{
 		SessionID:     session.ID,
 		ContainerID:   containerInfo.ID,
 		SSHUser:       req.UserID,
-		SSHHost:       "ssh.gw", // 실제 환경에서는 설정 가능하게
-		SSHPort:       22,
+		SSHHost:       "localhost", // 실제 환경에서는 설정 가능하게
+		SSHPort:       containerInfo.SSHPort,
 		SSHPrivateKey: containerInfo.SSHPrivateKey,
 		GPUUUID:       migInstance.UUID,
 		CreatedAt:     now,
@@ -187,11 +176,6 @@ func (s *Service) DeleteSessionByUserID(userID string) error {
 func (s *Service) cleanupSession(session *store.Session) error {
 	log.Printf("🧹 세션 정리 시작: %s (사용자: %s)", session.ID, session.UserID)
 
-	// SSH 라우팅 제거
-	if err := s.piperManager.RemoveRoute(session.UserID); err != nil {
-		log.Printf("⚠️ SSH 라우팅 제거 실패: %v", err)
-	}
-
 	// 컨테이너 중지 및 제거
 	if err := s.dockerClient.StopContainer(session.ContainerID); err != nil {
 		log.Printf("⚠️ 컨테이너 중지 실패: %v", err)
@@ -201,16 +185,14 @@ func (s *Service) cleanupSession(session *store.Session) error {
 		log.Printf("⚠️ 컨테이너 제거 실패: %v", err)
 	}
 
-	// GPU 해제
-	if session.GPUUUID != "" {
-		if err := s.gpuManager.ReleaseMIG(session.GPUUUID, session.UserID); err != nil {
-			log.Printf("⚠️ GPU 해제 실패: %v", err)
-		}
+	// GPU 인스턴스 해제
+	if err := s.gpuManager.ReleaseMIG(session.GPUUUID, session.UserID); err != nil {
+		log.Printf("⚠️ GPU 인스턴스 해제 실패: %v", err)
 	}
 
-	// 데이터베이스에서 제거
+	// 데이터베이스에서 세션 삭제
 	if err := s.store.DeleteSession(session.ID); err != nil {
-		log.Printf("⚠️ 세션 데이터베이스 제거 실패: %v", err)
+		log.Printf("⚠️ 세션 데이터 삭제 실패: %v", err)
 		return err
 	}
 
@@ -231,10 +213,6 @@ func (s *Service) CleanupExpiredSessions() error {
 		}
 	}
 
-	if len(expiredSessions) > 0 {
-		log.Printf("✅ %d개의 만료된 세션 정리 완료", len(expiredSessions))
-	}
-
 	return nil
 }
 
@@ -242,39 +220,16 @@ func (s *Service) ListAllSessions() ([]*store.Session, error) {
 	return s.store.ListAllSessions()
 }
 
-// DeleteAllSessions deletes all active sessions
 func (s *Service) DeleteAllSessions() error {
-	log.Printf("🧹 모든 세션 삭제 시작...")
-
-	// 모든 세션 조회
 	sessions, err := s.store.ListAllSessions()
 	if err != nil {
-		return fmt.Errorf("세션 목록 조회 실패: %v", err)
+		return err
 	}
-
-	if len(sessions) == 0 {
-		log.Printf("삭제할 세션이 없습니다")
-		return nil
-	}
-
-	// 각 세션을 순차적으로 정리
-	deletedCount := 0
-	failedCount := 0
 
 	for _, session := range sessions {
-		log.Printf("세션 정리 중: %s (사용자: %s)", session.ID, session.UserID)
 		if err := s.cleanupSession(session); err != nil {
-			log.Printf("⚠️ 세션 정리 실패: %s - %v", session.ID, err)
-			failedCount++
-		} else {
-			deletedCount++
+			log.Printf("⚠️ 세션 삭제 실패: %v", err)
 		}
-	}
-
-	log.Printf("✅ 모든 세션 삭제 완료 - 성공: %d, 실패: %d", deletedCount, failedCount)
-
-	if failedCount > 0 {
-		return fmt.Errorf("일부 세션 삭제 실패: %d개", failedCount)
 	}
 
 	return nil

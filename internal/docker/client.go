@@ -8,7 +8,9 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -20,7 +22,15 @@ import (
 )
 
 type Client struct {
-	cli *client.Client
+	cli         *client.Client
+	portManager *PortManager
+}
+
+type PortManager struct {
+	mu        sync.Mutex
+	startPort int
+	endPort   int
+	usedPorts map[int]bool
 }
 
 type ContainerConfig struct {
@@ -40,6 +50,7 @@ type ContainerInfo struct {
 	Status        string `json:"status"`
 	Created       string `json:"created"`
 	SSHPrivateKey string `json:"ssh_private_key"`
+	SSHPort       int    `json:"ssh_port"`
 }
 
 const (
@@ -50,13 +61,22 @@ const (
 	IPRangeEnd         = 254 // 10.100.0.254까지
 )
 
-func NewClient() (*Client, error) {
+func NewClient(sshPortStart, sshPortEnd int) (*Client, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("Docker 클라이언트 생성 실패: %v", err)
 	}
 
-	dockerClient := &Client{cli: cli}
+	portManager := &PortManager{
+		startPort: sshPortStart,
+		endPort:   sshPortEnd,
+		usedPorts: make(map[int]bool),
+	}
+
+	dockerClient := &Client{
+		cli:         cli,
+		portManager: portManager,
+	}
 
 	// 네트워크 초기화
 	if err := dockerClient.ensureNetwork(); err != nil {
@@ -65,6 +85,25 @@ func NewClient() (*Client, error) {
 
 	log.Println("✅ Docker 클라이언트 초기화 완료")
 	return dockerClient, nil
+}
+
+func (pm *PortManager) AllocatePort() (int, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	for port := pm.startPort; port <= pm.endPort; port++ {
+		if !pm.usedPorts[port] {
+			pm.usedPorts[port] = true
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("사용 가능한 포트가 없습니다")
+}
+
+func (pm *PortManager) ReleasePort(port int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.usedPorts, port)
 }
 
 func (c *Client) Close() error {
@@ -134,6 +173,12 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 		return nil, fmt.Errorf("사용 가능한 IP 찾기 실패: %v", err)
 	}
 
+	// SSH 포트 할당
+	sshPort, err := c.portManager.AllocatePort()
+	if err != nil {
+		return nil, fmt.Errorf("SSH 포트 할당 실패: %v", err)
+	}
+
 	// SSH 비밀번호 생성
 	if config.SSHPassword == "" {
 		config.SSHPassword = generateRandomPassword()
@@ -162,8 +207,21 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 				Source: config.WorkspaceDir,
 				Target: "/workspace",
 			},
+			{
+				Type:   mount.TypeVolume,
+				Source: "sandman_ssh_keys",
+				Target: "/shared/ssh_keys",
+			},
 		},
 		NetworkMode: container.NetworkMode(DefaultNetworkName),
+		PortBindings: nat.PortMap{
+			"22/tcp": []nat.PortBinding{
+				{
+					HostIP:   "0.0.0.0",
+					HostPort: fmt.Sprintf("%d", sshPort),
+				},
+			},
+		},
 		Resources: container.Resources{
 			DeviceRequests: []container.DeviceRequest{
 				{
@@ -177,13 +235,13 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 		RestartPolicy: container.RestartPolicy{
 			Name: "no",
 		},
-		AutoRemove: true,
+		AutoRemove: false, // 포트 관리를 위해 자동 제거 비활성화
 		SecurityOpt: []string{
 			"no-new-privileges:true",
 			"apparmor:unconfined",
 		},
-		CapDrop:        []string{"ALL"},
-		CapAdd:         []string{"SETUID", "SETGID", "DAC_OVERRIDE"},
+		// CapDrop:        []string{"ALL"},
+		// CapAdd:         []string{"SETUID", "SETGID", "DAC_OVERRIDE", "CHOWN"},
 		ReadonlyRootfs: false,
 	}
 
@@ -199,39 +257,40 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 	}
 
 	// 컨테이너 생성
-	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, networkConfig, nil, config.UserID+"-container")
+	containerName := fmt.Sprintf("%s-container", config.UserID)
+	resp, err := c.cli.ContainerCreate(ctx, containerConfig, hostConfig, networkConfig, nil, containerName)
 	if err != nil {
+		c.portManager.ReleasePort(sshPort)
 		return nil, fmt.Errorf("컨테이너 생성 실패: %v", err)
 	}
 
 	// 컨테이너 시작
 	if err := c.cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		c.portManager.ReleasePort(sshPort)
+		c.cli.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true})
 		return nil, fmt.Errorf("컨테이너 시작 실패: %v", err)
 	}
 
-	// 컨테이너가 준비될 때까지 잠시 대기
-	log.Printf("⏳ 컨테이너 시작 대기 중: %s", resp.ID[:12])
-	time.Sleep(3 * time.Second)
+	// SSH 키 추출을 위해 잠시 대기
+	time.Sleep(5 * time.Second)
 
-	// SSH 키 추출
-	log.Printf("🔍 SSH 키 추출 함수 호출 시작: %s", config.UserID)
-	privateKey, err := c.extractSSHPrivateKey(resp.ID, config.UserID)
+	// SSH 개인키 추출
+	sshPrivateKey, err := c.extractSSHPrivateKey(resp.ID, config.UserID)
 	if err != nil {
-		log.Printf("⚠️ SSH 키 추출 실패: %v", err)
-		// SSH 키 추출 실패해도 세션 생성은 계속 진행
-	} else {
-		log.Printf("✅ SSH 키 추출 완료: %s (길이: %d)", config.UserID, len(privateKey))
+		log.Printf("⚠️ SSH 개인키 추출 실패: %v", err)
+		sshPrivateKey = ""
 	}
 
-	log.Printf("🐳 컨테이너 생성됨: %s (IP: %s, GPU: %s)", resp.ID[:12], ip, config.GPUUUID)
+	log.Printf("✅ 컨테이너 생성 완료: %s (IP: %s, SSH 포트: %d)", resp.ID[:12], ip, sshPort)
 
 	return &ContainerInfo{
 		ID:            resp.ID,
 		IP:            ip,
 		Image:         image,
-		Status:        "created",
+		Status:        "running",
 		Created:       time.Now().Format(time.RFC3339),
-		SSHPrivateKey: privateKey,
+		SSHPrivateKey: sshPrivateKey,
+		SSHPort:       sshPort,
 	}, nil
 }
 
@@ -253,7 +312,23 @@ func (c *Client) StopContainer(containerID string) error {
 func (c *Client) RemoveContainer(containerID string) error {
 	ctx := context.Background()
 
-	err := c.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
+	// 컨테이너 정보 조회하여 포트 번호 확인
+	inspect, err := c.cli.ContainerInspect(ctx, containerID)
+	if err == nil {
+		// 포트 바인딩에서 SSH 포트 찾아서 해제
+		if inspect.HostConfig != nil && inspect.HostConfig.PortBindings != nil {
+			if bindings, exists := inspect.HostConfig.PortBindings["22/tcp"]; exists && len(bindings) > 0 {
+				if hostPort := bindings[0].HostPort; hostPort != "" {
+					if port := parsePort(hostPort); port > 0 {
+						c.portManager.ReleasePort(port)
+						log.Printf("🔓 포트 해제됨: %d", port)
+					}
+				}
+			}
+		}
+	}
+
+	err = c.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{
 		Force:         true,
 		RemoveVolumes: true,
 	})
@@ -264,6 +339,13 @@ func (c *Client) RemoveContainer(containerID string) error {
 
 	log.Printf("🗑️ 컨테이너 제거됨: %s", containerID[:12])
 	return nil
+}
+
+func parsePort(portStr string) int {
+	if port, err := strconv.Atoi(portStr); err == nil {
+		return port
+	}
+	return 0
 }
 
 func (c *Client) GetContainerInfo(containerID string) (*ContainerInfo, error) {
@@ -379,59 +461,44 @@ func generateRandomPassword() string {
 }
 
 func (c *Client) extractSSHPrivateKey(containerID, userID string) (string, error) {
-	ctx := context.Background()
-
-	// 컨테이너에서 SSH 개인키 파일 읽기
-	keyPath := fmt.Sprintf("/tmp/ssh_private_key_%s", userID)
+	// 공유 볼륨에서 직접 SSH 키 파일 읽기
+	keyPath := fmt.Sprintf("/shared/ssh_keys/ssh_private_key_%s", userID)
 
 	log.Printf("🔍 SSH 키 추출 시작: %s (경로: %s)", userID, keyPath)
 
-	// 최대 30초 동안 SSH 키 생성을 기다림
+	// 최대 30초 동안 SSH 키 파일이 생성될 때까지 기다림
 	for i := 0; i < 30; i++ {
-		cmd := []string{"cat", keyPath}
+		// 파일 존재 확인
+		if _, err := os.Stat(keyPath); err == nil {
+			// 파일이 존재하면 읽기
+			content, err := os.ReadFile(keyPath)
+			if err != nil {
+				log.Printf("⚠️ SSH 키 파일 읽기 실패 (시도 %d/30): %v", i+1, err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
 
-		execConfig := types.ExecConfig{
-			Cmd:          cmd,
-			AttachStdout: true,
-			AttachStderr: true,
-		}
+			privateKey := string(content)
+			log.Printf("🔍 SSH 키 내용 확인 (길이: %d)", len(privateKey))
 
-		execIDResp, err := c.cli.ContainerExecCreate(ctx, containerID, execConfig)
-		if err != nil {
-			log.Printf("⚠️ SSH 키 추출 명령 생성 실패 (시도 %d/30): %v", i+1, err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
+			// SSH 키 정리 및 유효성 검증
+			cleanedKey := cleanSSHKey(privateKey)
+			if len(cleanedKey) > 0 && (strings.Contains(cleanedKey, "BEGIN OPENSSH PRIVATE KEY") ||
+				strings.Contains(cleanedKey, "BEGIN RSA PRIVATE KEY") ||
+				strings.Contains(cleanedKey, "BEGIN EC PRIVATE KEY")) {
+				log.Printf("🔑 SSH 개인키 추출 성공: %s (길이: %d바이트)", userID, len(cleanedKey))
 
-		resp, err := c.cli.ContainerExecAttach(ctx, execIDResp.ID, types.ExecStartCheck{})
-		if err != nil {
-			log.Printf("⚠️ SSH 키 추출 명령 실행 실패 (시도 %d/30): %v", i+1, err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		defer resp.Close()
+				// 디버깅: 키 파일은 삭제하지 않음 (재사용 가능하도록)
+				// os.Remove(keyPath)
 
-		// 출력 읽기
-		output, err := io.ReadAll(resp.Reader)
-		if err != nil {
-			log.Printf("⚠️ SSH 키 출력 읽기 실패 (시도 %d/30): %v", i+1, err)
-			time.Sleep(1 * time.Second)
-			continue
-		}
+				return cleanedKey, nil
+			}
 
-		privateKey := string(output)
-		log.Printf("🔍 SSH 키 내용 확인 (길이: %d)", len(privateKey))
-
-		// SSH 키 유효성 검증 - 더 포괄적인 조건
-		if len(privateKey) > 0 && (strings.Contains(privateKey, "BEGIN OPENSSH PRIVATE KEY") ||
-			strings.Contains(privateKey, "BEGIN RSA PRIVATE KEY") ||
-			strings.Contains(privateKey, "BEGIN EC PRIVATE KEY")) {
-			log.Printf("🔑 SSH 개인키 추출 성공: %s (길이: %d바이트)", userID, len(privateKey))
-			return privateKey, nil
-		}
-
-		if len(privateKey) > 0 {
-			log.Printf("⚠️ SSH 키 형식 불일치 (시도 %d/30): 길이=%d, 미리보기=%s", i+1, len(privateKey), privateKey[:min(50, len(privateKey))])
+			if len(privateKey) > 0 {
+				log.Printf("⚠️ SSH 키 형식 불일치 (시도 %d/30): 길이=%d, 내용: %s", i+1, len(privateKey), privateKey[:min(100, len(privateKey))])
+			}
+		} else {
+			log.Printf("⏳ SSH 키 파일 대기 중 (시도 %d/30): %s", i+1, keyPath)
 		}
 
 		time.Sleep(1 * time.Second)
@@ -439,4 +506,59 @@ func (c *Client) extractSSHPrivateKey(containerID, userID string) (string, error
 
 	log.Printf("❌ SSH 키 추출 시간 초과: %s", userID)
 	return "", fmt.Errorf("SSH 키 추출 시간 초과: %s", userID)
+}
+
+// cleanSSHKey는 SSH 키에서 바이너리 데이터를 제거하고 유효한 키만 반환합니다
+func cleanSSHKey(rawKey string) string {
+	// 개행 문자 정규화
+	cleanKey := strings.ReplaceAll(rawKey, "\r\n", "\n")
+	cleanKey = strings.ReplaceAll(cleanKey, "\r", "\n")
+
+	// ASCII가 아닌 문자 제거 (SSH 키는 ASCII 기반)
+	var result strings.Builder
+	for _, r := range cleanKey {
+		if r <= 127 && (r >= 32 || r == '\n' || r == '\t') {
+			result.WriteRune(r)
+		}
+	}
+
+	cleanKey = result.String()
+
+	// SSH 키 블록 추출
+	beginIndex := strings.Index(cleanKey, "-----BEGIN")
+	endIndex := strings.LastIndex(cleanKey, "-----END")
+
+	if beginIndex != -1 && endIndex != -1 && endIndex > beginIndex {
+		// SSH 키 블록만 추출
+		keyBlock := cleanKey[beginIndex:]
+		endMarker := strings.Index(keyBlock, "-----\n")
+		if endMarker == -1 {
+			endMarker = strings.Index(keyBlock, "-----")
+		}
+		if endMarker != -1 {
+			// END 마커까지 포함하여 추출
+			endMarkerEnd := strings.Index(keyBlock[endMarker:], "\n")
+			if endMarkerEnd != -1 {
+				keyBlock = keyBlock[:endMarker+endMarkerEnd]
+			} else {
+				keyBlock = keyBlock[:endMarker+5] // "-----" 길이
+			}
+		}
+
+		// 마지막 정리
+		keyBlock = strings.TrimSpace(keyBlock)
+		if !strings.HasSuffix(keyBlock, "-----") {
+			if strings.Contains(keyBlock, "OPENSSH PRIVATE KEY") {
+				keyBlock += "\n-----END OPENSSH PRIVATE KEY-----"
+			} else if strings.Contains(keyBlock, "RSA PRIVATE KEY") {
+				keyBlock += "\n-----END RSA PRIVATE KEY-----"
+			} else if strings.Contains(keyBlock, "EC PRIVATE KEY") {
+				keyBlock += "\n-----END EC PRIVATE KEY-----"
+			}
+		}
+
+		return keyBlock
+	}
+
+	return cleanKey
 }

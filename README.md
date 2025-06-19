@@ -1,26 +1,27 @@
-# 🎯 GPU SSH Gateway
+# 🎯 Sandman
 
-관리자가 API로 특정 사용자 전용 컨테이너를 생성하면, 사용자가 `ssh user123@ssh.gw` 명령으로 접속해 MIG GPU 리소스와 영구 볼륨이 자동 할당된 개별 환경에 접근할 수 있는 SSH 게이트웨이 시스템입니다.
+관리자가 API로 특정 사용자 전용 컨테이너를 생성하면, 사용자가 `ssh user123@host:PORT` 명령으로 접속해 MIG GPU 리소스와 영구 볼륨이 자동 할당된 개별 환경에 접근할 수 있는 GPU SSH 게이트웨이 시스템입니다.
 
 ## 🚀 주요 기능
 
 - **GPU MIG 인스턴스 동적 할당 및 회수**
 - **볼륨 마운트 및 격리된 컨테이너 생성**  
-- **단일 SSH 진입점에서 여러 컨테이너로 라우팅** (SSHPiper)
+- **직접 포트 바인딩을 통한 SSH 접속** (10000-20000 포트 범위)
 - **세션 자동 종료 / 관리** (TTL)
 
 ## 📦 시스템 구성
 
 ```
-┌─────────────────┐    SSH     ┌─────────────────┐
-│   👤 사용자      │ ───────→  │ 🔀 SSHPiper     │
-│ ssh user@ssh.gw │           │   Gateway       │
+┌─────────────────┐    SSH    ┌─────────────────┐
+│      User       │ ───────→  │  Host:PORT      │
+│ ssh user@host:  │           │  (10000-20000)  │
+│     10001       │           │                 │
 └─────────────────┘           └─────────────────┘
                                         │
                                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │             🧠 Orchestrator 데몬                         │
-│  • 세션 관리  • GPU/MIG 할당  • pipe.yaml 동기화        │
+│  • 세션 관리  • GPU/MIG 할당  • 포트 할당/해제            │
 └─────────────────────────────────────────────────────────┘
                                         │
                                         ▼
@@ -33,6 +34,7 @@
 ┌─────────────────────────────────────────────────────────┐
 │              📦 Session 컨테이너                         │
 │  • OpenSSH  • GPU/MIG 할당  • 전용 볼륨 마운트          │
+│  • 직접 포트 바인딩 (10000-20000)                      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -61,69 +63,381 @@ docker build -f Dockerfile.gpu-workspace -t gpu-workspace .
 
 ```bash
 # 필요한 디렉토리 생성
-sudo mkdir -p /srv/workspaces /var/lib/orchestrator /etc/sshpiper
+sudo mkdir -p /srv/workspaces /var/lib/orchestrator
 
 # Docker Compose로 실행
 docker-compose up -d
 ```
 
-## 📖 API 사용법
+## 📖 API 엔드포인트
 
-### 세션 생성
+### 🔍 시스템 상태
 
+#### 헬스체크
 ```bash
-curl -X POST http://localhost:8080/sessions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "user123",
-    "ttl_minutes": 60,
-    "mig_profile": "3g.20gb"
-  }'
+GET /healthz
 ```
-
 **응답:**
 ```json
 {
-  "session_id": "abc-123-def",
-  "container_id": "container123",
+  "status": "healthy",
+  "service": "gpu-ssh-gateway-orchestrator"
+}
+```
+
+---
+
+### 👤 세션 관리
+
+#### 1. 세션 생성
+```bash
+POST /sessions
+Content-Type: application/json
+```
+
+**요청 본문:**
+```json
+{
+  "user_id": "user123",          // 필수: 사용자 ID
+  "ttl_minutes": 60,             // 선택: TTL (기본값: 60분)
+  "mig_profile": "3g.20gb",      // 선택: MIG 프로파일 (기본값: 3g.20gb)
+  "mig_instance_uuid": "...",    // 선택: 특정 MIG 인스턴스 UUID
+  "image": "gpu-workspace"       // 선택: 커스텀 이미지
+}
+```
+
+**응답 (201 Created):**
+```json
+{
+  "session_id": "abc-123-def-456",
+  "container_id": "container_789",
   "ssh_user": "user123",
-  "ssh_host": "ssh.gw",
-  "ssh_port": 22,
-  "gpu_uuid": "MIG-GPU-3e9c/3/0",
+  "ssh_host": "localhost",
+  "ssh_port": 10001,
+  "ssh_private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...",
+  "gpu_uuid": "MIG-GPU-3e9c9c52/3/0",
   "created_at": "2025-01-17T08:00:00Z",
   "expires_at": "2025-01-17T09:00:00Z"
 }
 ```
 
-### SSH 접속
-
+**사용 예시:**
 ```bash
-ssh user123@ssh.gw
+# 기본 세션 생성
+curl -X POST http://localhost:8080/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "user123",
+    "ttl_minutes": 120,
+    "mig_profile": "3g.20gb"
+  }'
+
+# 특정 GPU 인스턴스로 세션 생성
+curl -X POST http://localhost:8080/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "user456",
+    "mig_instance_uuid": "MIG-GPU-12345678/1/0"
+  }'
 ```
 
-### 세션 조회
-
+#### 2. 특정 세션 조회
 ```bash
-curl http://localhost:8080/sessions/abc-123-def
+GET /sessions/{session_id}
 ```
 
-### 세션 삭제
-
-```bash
-curl -X DELETE http://localhost:8080/sessions/abc-123-def
+**응답 (200 OK):**
+```json
+{
+  "id": "abc-123-def-456",
+  "user_id": "user123",
+  "container_id": "container_789",
+  "container_ip": "172.20.0.10",
+  "ssh_port": 10001,
+  "gpu_uuid": "MIG-GPU-3e9c9c52/3/0",
+  "mig_profile": "3g.20gb",
+  "ttl_minutes": 60,
+  "created_at": "2025-01-17T08:00:00Z",
+  "expires_at": "2025-01-17T09:00:00Z",
+  "metadata": {
+    "image": "gpu-workspace",
+    "workspace": "/srv/workspaces/user123",
+    "ssh_port": "10001"
+  }
+}
 ```
 
-### GPU 정보 조회
+**사용 예시:**
+```bash
+curl http://localhost:8080/sessions/abc-123-def-456
+```
 
+#### 3. 모든 세션 목록 조회
+```bash
+GET /sessions
+```
+
+**응답 (200 OK):**
+```json
+[
+  {
+    "id": "session-1",
+    "user_id": "user123",
+    "container_id": "container_789",
+    "container_ip": "172.20.0.10",
+    "ssh_port": 10001,
+    "gpu_uuid": "MIG-GPU-3e9c9c52/3/0",
+    "mig_profile": "3g.20gb",
+    "created_at": "2025-01-17T08:00:00Z",
+    "expires_at": "2025-01-17T09:00:00Z"
+  },
+  {
+    "id": "session-2",
+    "user_id": "user456",
+    "container_id": "container_456",
+    "container_ip": "172.20.0.11",
+    "ssh_port": 10002,
+    "gpu_uuid": "MIG-GPU-3e9c9c52/1/0",
+    "mig_profile": "1g.10gb",
+    "created_at": "2025-01-17T08:15:00Z",
+    "expires_at": "2025-01-17T09:15:00Z"
+  }
+]
+```
+
+**사용 예시:**
+```bash
+curl http://localhost:8080/sessions
+```
+
+#### 4. 특정 세션 삭제
+```bash
+DELETE /sessions/{session_id}
+```
+
+**응답 (200 OK):**
+```json
+{
+  "message": "세션이 성공적으로 삭제되었습니다"
+}
+```
+
+**사용 예시:**
+```bash
+curl -X DELETE http://localhost:8080/sessions/abc-123-def-456
+```
+
+#### 5. 모든 세션 삭제
+```bash
+DELETE /sessions
+```
+
+**응답 (200 OK):**
+```json
+{
+  "message": "모든 세션이 성공적으로 삭제되었습니다"
+}
+```
+
+**사용 예시:**
+```bash
+curl -X DELETE http://localhost:8080/sessions
+```
+
+---
+
+### 🎮 GPU 관리
+
+#### 1. GPU 정보 조회
+```bash
+GET /gpus
+```
+
+**응답 (200 OK):**
+```json
+{
+  "gpus": [
+    {
+      "uuid": "GPU-12345678-1234-1234-1234-123456789012",
+      "name": "NVIDIA A100-SXM4-80GB",
+      "memory_total": 85899345920,
+      "memory_free": 85899345920,
+      "memory_used": 0,
+      "utilization": 0,
+      "temperature": 35,
+      "power_usage": 65.2,
+      "power_limit": 400,
+      "mig_enabled": true,
+      "mig_instances": [
+        {
+          "uuid": "MIG-GPU-12345678/3/0",
+          "profile": "3g.20gb",
+          "memory": 21474836480,
+          "allocated": false
+        }
+      ]
+    }
+  ],
+  "count": 1
+}
+```
+
+**사용 예시:**
 ```bash
 curl http://localhost:8080/gpus
 ```
 
-### 지원되는 MIG 프로파일 조회
+#### 2. 지원되는 MIG 프로파일 조회
+```bash
+GET /gpus/profiles
+```
 
+**응답 (200 OK):**
+```json
+{
+  "profiles": [
+    {
+      "name": "1g.5gb",
+      "compute_slices": 1,
+      "memory_slices": 1,
+      "memory_size": 5368709120,
+      "description": "1/7 GPU, 5GB Memory"
+    },
+    {
+      "name": "1g.10gb",
+      "compute_slices": 1,
+      "memory_slices": 2,
+      "memory_size": 10737418240,
+      "description": "1/7 GPU, 10GB Memory"
+    },
+    {
+      "name": "2g.10gb",
+      "compute_slices": 2,
+      "memory_slices": 2,
+      "memory_size": 10737418240,
+      "description": "2/7 GPU, 10GB Memory"
+    },
+    {
+      "name": "3g.20gb",
+      "compute_slices": 3,
+      "memory_slices": 4,
+      "memory_size": 21474836480,
+      "description": "3/7 GPU, 20GB Memory"
+    },
+    {
+      "name": "4g.20gb",
+      "compute_slices": 4,
+      "memory_slices": 4,
+      "memory_size": 21474836480,
+      "description": "4/7 GPU, 20GB Memory"
+    },
+    {
+      "name": "7g.40gb",
+      "compute_slices": 7,
+      "memory_slices": 8,
+      "memory_size": 42949672960,
+      "description": "7/7 GPU, 40GB Memory"
+    }
+  ]
+}
+```
+
+**사용 예시:**
 ```bash
 curl http://localhost:8080/gpus/profiles
 ```
+
+#### 3. 사용 가능한 MIG 인스턴스 조회
+```bash
+GET /gpus/available
+```
+
+**응답 (200 OK):**
+```json
+{
+  "available_instances": [
+    {
+      "uuid": "MIG-GPU-12345678/1/0",
+      "profile": "1g.10gb",
+      "memory": 10737418240,
+      "compute_slices": 1,
+      "memory_slices": 2,
+      "parent_gpu": "GPU-12345678-1234-1234-1234-123456789012",
+      "allocated": false
+    },
+    {
+      "uuid": "MIG-GPU-12345678/3/0",
+      "profile": "3g.20gb",
+      "memory": 21474836480,
+      "compute_slices": 3,
+      "memory_slices": 4,
+      "parent_gpu": "GPU-12345678-1234-1234-1234-123456789012",
+      "allocated": false
+    }
+  ],
+  "count": 2
+}
+```
+
+**사용 예시:**
+```bash
+curl http://localhost:8080/gpus/available
+```
+
+---
+
+### 📝 API 응답 코드
+
+| 상태 코드 | 설명 |
+|----------|------|
+| `200 OK` | 요청 성공 |
+| `201 Created` | 리소스 생성 성공 (세션 생성) |
+| `400 Bad Request` | 잘못된 요청 형식 |
+| `404 Not Found` | 리소스를 찾을 수 없음 |
+| `500 Internal Server Error` | 서버 내부 오류 |
+
+### 🔧 에러 응답 형식
+
+```json
+{
+  "error": "에러 메시지 설명"
+}
+```
+
+### 💡 API 사용 팁
+
+1. **세션 생성 시 주의사항:**
+   - `user_id`는 고유해야 하며, 기존 활성 세션이 있으면 생성 실패
+   - `mig_profile`과 `mig_instance_uuid` 중 하나만 지정
+   - 사용 가능한 GPU 리소스가 없으면 생성 실패
+   - 포트는 10000-20000 범위에서 자동 할당됨
+
+2. **SSH 접속:**
+   ```bash
+   # 기본 접속 (비밀번호 인증)
+   ssh user123@localhost -p 10001
+   
+   # 키 기반 접속 (응답의 private_key 사용)
+   ssh -i private_key user123@localhost -p 10001
+   ```
+
+3. **세션 모니터링:**
+   ```bash
+   # 주기적으로 세션 상태 확인
+   watch -n 5 'curl -s http://localhost:8080/sessions | jq .'
+   
+   # 특정 사용자 세션 확인
+   curl -s http://localhost:8080/sessions | jq '.[] | select(.user_id=="user123")'
+   ```
+
+4. **리소스 정리:**
+   ```bash
+   # 만료된 세션은 자동으로 정리되지만, 수동 정리도 가능
+   curl -X DELETE http://localhost:8080/sessions/{session_id}
+   
+   # 긴급시 모든 세션 정리
+   curl -X DELETE http://localhost:8080/sessions
+   ```
 
 ## 🎮 지원되는 MIG 프로파일
 
@@ -143,8 +457,9 @@ curl http://localhost:8080/gpus/profiles
 |----------------------|-------------------------------|-----------------|
 | `--port`             | `8080`                        | API 서버 포트       |
 | `--db`               | `/var/lib/orchestrator/sessions.db` | SQLite DB 경로 |
-| `--piper-config`     | `/etc/sshpiper/pipe.yaml`    | SSHPiper 설정 경로  |
 | `--workspace-root`   | `/srv/workspaces`             | 워크스페이스 루트 디렉토리 |
+| `--ssh-port-start`   | `10000`                       | SSH 포트 범위 시작   |
+| `--ssh-port-end`     | `20000`                       | SSH 포트 범위 끝    |
 
 ### 디렉토리 구조
 
@@ -161,8 +476,9 @@ curl http://localhost:8080/gpus/profiles
 ## 🔒 보안 고려사항
 
 - **컨테이너 격리**: `--cap-drop ALL` + `--security-opt no-new-privileges:true`
-- **네트워크 격리**: `worknet` 외부 접근 불가, SSHPiper만 포워딩
+- **네트워크 격리**: `worknet` 내부 네트워크 사용
 - **GPU 제한**: `--gpus device=UUID`로 특정 MIG 인스턴스만 접근
+- **포트 제한**: 10000-20000 포트 범위로 SSH 접속 제한
 - **호스트 보호**: 루트 볼륨 접근 제거, 사용자 마운트만 허용
 
 ## 🧹 세션 관리
@@ -174,7 +490,7 @@ curl http://localhost:8080/gpus/profiles
 - **정리 과정**:
   1. 컨테이너 중지 및 제거
   2. MIG 인스턴스 해제
-  3. SSH 라우팅 규칙 제거
+  3. SSH 포트 해제
   4. 데이터베이스 레코드 삭제
 
 ### 수동 정리
@@ -194,9 +510,6 @@ curl http://localhost:8080/sessions
 ```bash
 # Orchestrator 로그
 docker logs gpu-ssh-orchestrator
-
-# SSHPiper 로그  
-docker logs sshpiper
 
 # 특정 사용자 컨테이너 로그
 docker logs user123-container
@@ -227,11 +540,11 @@ nvtop
 
 2. **SSH 연결 실패**
    ```bash
-   # SSHPiper 설정 확인
-   cat /etc/sshpiper/pipe.yaml
+   # 포트 확인
+   docker ps | grep user123
    
    # 컨테이너 네트워크 확인
-   docker network inspect worknet
+   docker network inspect sandman_worknet
    ```
 
 3. **컨테이너 시작 실패**
@@ -241,6 +554,17 @@ nvtop
    
    # GPU 할당 확인
    docker run --rm --gpus all nvidia/cuda:12.2-runtime-ubuntu24.04 nvidia-smi
+   ```
+
+4. **포트 범위 부족**
+   ```bash
+   # 사용 중인 포트 확인
+   netstat -tlnp | grep :10[0-9][0-9][0-9]
+   
+   # 포트 범위 확장
+   docker-compose down
+   # docker-compose.yml에서 포트 범위 수정
+   docker-compose up -d
    ```
 
 ## 🤝 기여
