@@ -9,12 +9,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /srv/workspaces:/srv/workspaces
       - /var/lib/orchestrator:/var/lib/orchestrator
-      - ssh_keys:/shared/ssh_keys
+      - .:/app/source
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     runtime: nvidia
     restart: unless-stopped
 
 volumes:
-  orchestrator_data:
-  ssh_keys: 
+  orchestrator_data: 

@@ -134,13 +134,16 @@ func (s *Service) CreateSession(req CreateRequest) (*CreateResponse, error) {
 
 	log.Printf("✅ 세션 생성 완료: %s (사용자: %s, GPU: %s, SSH 포트: %d)", session.ID, req.UserID, migInstance.UUID, containerInfo.SSHPort)
 
+	// SSH 개인키를 응답에 포함하되, 보안을 위해 메모리에서 즉시 클리어
+	sshPrivateKey := containerInfo.SSHPrivateKey
+
 	return &CreateResponse{
 		SessionID:     session.ID,
 		ContainerID:   containerInfo.ID,
 		SSHUser:       req.UserID,
 		SSHHost:       "localhost", // 실제 환경에서는 설정 가능하게
 		SSHPort:       containerInfo.SSHPort,
-		SSHPrivateKey: containerInfo.SSHPrivateKey,
+		SSHPrivateKey: sshPrivateKey,
 		GPUUUID:       migInstance.UUID,
 		CreatedAt:     now,
 		ExpiresAt:     expiresAt,

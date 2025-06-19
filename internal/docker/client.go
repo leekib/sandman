@@ -1,15 +1,20 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	mathrand "math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +24,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"golang.org/x/crypto/ssh"
 )
 
 type Client struct {
@@ -39,6 +45,7 @@ type ContainerConfig struct {
 	WorkspaceDir  string
 	SSHPassword   string
 	SSHPrivateKey string
+	SSHPublicKey  string
 	Image         string
 	NetworkName   string
 }
@@ -152,14 +159,18 @@ func (c *Client) ensureNetwork() error {
 func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error) {
 	ctx := context.Background()
 
-	// 이미지 준비
-	image := config.Image
-	if image == "" {
-		image = DefaultImage
+	// SSH 키 쌍 생성
+	publicKey, privateKey, err := c.generateSSHKeyPair(config.UserID)
+	if err != nil {
+		return nil, fmt.Errorf("SSH 키 생성 실패: %v", err)
 	}
 
-	if err := c.pullImageIfNotExists(ctx, image); err != nil {
-		return nil, fmt.Errorf("이미지 준비 실패: %v", err)
+	log.Printf("🔑 SSH 키 쌍 생성 완료: %s", config.UserID)
+
+	// 이미지 빌드 (공개키를 ARG로 전달)
+	imageName, err := c.buildImageWithSSHKey(ctx, config.UserID, publicKey)
+	if err != nil {
+		return nil, fmt.Errorf("이미지 빌드 실패: %v", err)
 	}
 
 	// 워크스페이스 디렉토리 생성
@@ -186,7 +197,7 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 
 	// 컨테이너 설정
 	containerConfig := &container.Config{
-		Image: image,
+		Image: imageName,
 		Env: []string{
 			"NVIDIA_VISIBLE_DEVICES=" + config.GPUUUID,
 			"SSH_PASSWORD=" + config.SSHPassword,
@@ -195,22 +206,17 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 		ExposedPorts: nat.PortSet{
 			"22/tcp": struct{}{},
 		},
-		Cmd:        []string{"/start.sh"},
+		// Cmd:        []string{"/start.sh"},
 		WorkingDir: "/workspace",
 	}
 
-	// 호스트 설정
+	// 호스트 설정 (공유 볼륨 제거)
 	hostConfig := &container.HostConfig{
 		Mounts: []mount.Mount{
 			{
 				Type:   mount.TypeBind,
 				Source: config.WorkspaceDir,
 				Target: "/workspace",
-			},
-			{
-				Type:   mount.TypeVolume,
-				Source: "sandman_ssh_keys",
-				Target: "/shared/ssh_keys",
 			},
 		},
 		NetworkMode: container.NetworkMode(DefaultNetworkName),
@@ -240,8 +246,6 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 			"no-new-privileges:true",
 			"apparmor:unconfined",
 		},
-		// CapDrop:        []string{"ALL"},
-		// CapAdd:         []string{"SETUID", "SETGID", "DAC_OVERRIDE", "CHOWN"},
 		ReadonlyRootfs: false,
 	}
 
@@ -271,25 +275,15 @@ func (c *Client) CreateContainer(config ContainerConfig) (*ContainerInfo, error)
 		return nil, fmt.Errorf("컨테이너 시작 실패: %v", err)
 	}
 
-	// SSH 키 추출을 위해 잠시 대기
-	time.Sleep(5 * time.Second)
-
-	// SSH 개인키 추출
-	sshPrivateKey, err := c.extractSSHPrivateKey(resp.ID, config.UserID)
-	if err != nil {
-		log.Printf("⚠️ SSH 개인키 추출 실패: %v", err)
-		sshPrivateKey = ""
-	}
-
 	log.Printf("✅ 컨테이너 생성 완료: %s (IP: %s, SSH 포트: %d)", resp.ID[:12], ip, sshPort)
 
 	return &ContainerInfo{
 		ID:            resp.ID,
 		IP:            ip,
-		Image:         image,
+		Image:         imageName,
 		Status:        "running",
 		Created:       time.Now().Format(time.RFC3339),
-		SSHPrivateKey: sshPrivateKey,
+		SSHPrivateKey: privateKey,
 		SSHPort:       sshPort,
 	}, nil
 }
@@ -455,110 +449,144 @@ func generateRandomPassword() string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, 12)
 	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+		b[i] = charset[mathrand.Intn(len(charset))]
 	}
 	return string(b)
 }
 
-func (c *Client) extractSSHPrivateKey(containerID, userID string) (string, error) {
-	// 공유 볼륨에서 직접 SSH 키 파일 읽기
-	keyPath := fmt.Sprintf("/shared/ssh_keys/ssh_private_key_%s", userID)
-
-	log.Printf("🔍 SSH 키 추출 시작: %s (경로: %s)", userID, keyPath)
-
-	// 최대 30초 동안 SSH 키 파일이 생성될 때까지 기다림
-	for i := 0; i < 30; i++ {
-		// 파일 존재 확인
-		if _, err := os.Stat(keyPath); err == nil {
-			// 파일이 존재하면 읽기
-			content, err := os.ReadFile(keyPath)
-			if err != nil {
-				log.Printf("⚠️ SSH 키 파일 읽기 실패 (시도 %d/30): %v", i+1, err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			privateKey := string(content)
-			log.Printf("🔍 SSH 키 내용 확인 (길이: %d)", len(privateKey))
-
-			// SSH 키 정리 및 유효성 검증
-			cleanedKey := cleanSSHKey(privateKey)
-			if len(cleanedKey) > 0 && (strings.Contains(cleanedKey, "BEGIN OPENSSH PRIVATE KEY") ||
-				strings.Contains(cleanedKey, "BEGIN RSA PRIVATE KEY") ||
-				strings.Contains(cleanedKey, "BEGIN EC PRIVATE KEY")) {
-				log.Printf("🔑 SSH 개인키 추출 성공: %s (길이: %d바이트)", userID, len(cleanedKey))
-
-				// 디버깅: 키 파일은 삭제하지 않음 (재사용 가능하도록)
-				// os.Remove(keyPath)
-
-				return cleanedKey, nil
-			}
-
-			if len(privateKey) > 0 {
-				log.Printf("⚠️ SSH 키 형식 불일치 (시도 %d/30): 길이=%d, 내용: %s", i+1, len(privateKey), privateKey[:min(100, len(privateKey))])
-			}
-		} else {
-			log.Printf("⏳ SSH 키 파일 대기 중 (시도 %d/30): %s", i+1, keyPath)
-		}
-
-		time.Sleep(1 * time.Second)
+// generateSSHKeyPair은 SSH 키 쌍을 생성합니다
+func (c *Client) generateSSHKeyPair(userID string) (string, string, error) {
+	// 1. 개인키 생성
+	bits := 2048
+	privateKey, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		return "", "", err
 	}
 
-	log.Printf("❌ SSH 키 추출 시간 초과: %s", userID)
-	return "", fmt.Errorf("SSH 키 추출 시간 초과: %s", userID)
+	// 2. PEM 형식으로 인코딩된 개인키
+	privDER := x509.MarshalPKCS1PrivateKey(privateKey)
+	privBlock := pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: privDER,
+	}
+	privateKeyPEM := string(pem.EncodeToMemory(&privBlock))
+
+	// 3. SSH 공개키 생성
+	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return "", "", err
+	}
+	publicKey := string(ssh.MarshalAuthorizedKey(pub)) // id_rsa.pub 형태
+	log.Printf("🔑 SSH 키 생성 성공: %s (공개키 길이: %d, 개인키 길이: %d)",
+		userID, len(publicKey), len(privateKeyPEM))
+	return publicKey, privateKeyPEM, nil
 }
 
-// cleanSSHKey는 SSH 키에서 바이너리 데이터를 제거하고 유효한 키만 반환합니다
-func cleanSSHKey(rawKey string) string {
-	// 개행 문자 정규화
-	cleanKey := strings.ReplaceAll(rawKey, "\r\n", "\n")
-	cleanKey = strings.ReplaceAll(cleanKey, "\r", "\n")
+// buildImageWithSSHKey는 SSH 공개키를 포함한 이미지를 빌드합니다
+func (c *Client) buildImageWithSSHKey(ctx context.Context, userID, publicKey string) (string, error) {
+	imageName := fmt.Sprintf("gpu-workspace-%s", userID)
 
-	// ASCII가 아닌 문자 제거 (SSH 키는 ASCII 기반)
-	var result strings.Builder
-	for _, r := range cleanKey {
-		if r <= 127 && (r >= 32 || r == '\n' || r == '\t') {
-			result.WriteRune(r)
+	log.Printf("🏗️ 사용자별 이미지 빌드 시작: %s", imageName)
+
+	// Dockerfile 경로 확인 (컨테이너 내 마운트된 경로)
+	dockerfilePath := "/app/source/Dockerfile.gpu-workspace"
+	if _, err := os.Stat(dockerfilePath); os.IsNotExist(err) {
+		return "", fmt.Errorf("Dockerfile을 찾을 수 없습니다: %s", dockerfilePath)
+	}
+
+	// 빌드 컨텍스트 생성 (마운트된 소스 디렉토리)
+	buildContext, err := c.createBuildContext("/app/source")
+	if err != nil {
+		return "", fmt.Errorf("빌드 컨텍스트 생성 실패: %v", err)
+	}
+	defer buildContext.Close()
+
+	// 빌드 옵션 설정
+	buildOptions := types.ImageBuildOptions{
+		Dockerfile: "Dockerfile.gpu-workspace", // 상대 경로로 변경
+		Tags:       []string{imageName},
+		BuildArgs: map[string]*string{
+			"USERNAME": &userID,
+			"UID":      stringPtr("1001"),
+			"GID":      stringPtr("1001"),
+			"PUBKEY":   &publicKey,
+		},
+		Remove:      true,
+		ForceRemove: true,
+		NoCache:     false, // 캐시 사용으로 빌드 속도 향상
+	}
+
+	// 이미지 빌드
+	resp, err := c.cli.ImageBuild(ctx, buildContext, buildOptions)
+	if err != nil {
+		return "", fmt.Errorf("이미지 빌드 실패: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 빌드 로그 처리 (에러 확인)
+	_, err = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("빌드 로그 처리 실패: %v", err)
+	}
+
+	log.Printf("✅ 사용자별 이미지 빌드 완료: %s", imageName)
+	return imageName, nil
+}
+
+// createBuildContext는 빌드 컨텍스트를 tar 형식으로 생성합니다
+func (c *Client) createBuildContext(contextDir string) (io.ReadCloser, error) {
+	buf := bytes.NewBuffer(nil)
+	tarWriter := tar.NewWriter(buf)
+	defer tarWriter.Close()
+
+	// 필요한 파일들을 tar에 추가
+	files := []string{
+		"Dockerfile.gpu-workspace",
+		"start.sh",
+	}
+
+	for _, file := range files {
+		filePath := filepath.Join(contextDir, file)
+		if err := c.addFileToTar(tarWriter, filePath, file); err != nil {
+			return nil, fmt.Errorf("파일 추가 실패 (%s): %v", file, err)
 		}
 	}
 
-	cleanKey = result.String()
-
-	// SSH 키 블록 추출
-	beginIndex := strings.Index(cleanKey, "-----BEGIN")
-	endIndex := strings.LastIndex(cleanKey, "-----END")
-
-	if beginIndex != -1 && endIndex != -1 && endIndex > beginIndex {
-		// SSH 키 블록만 추출
-		keyBlock := cleanKey[beginIndex:]
-		endMarker := strings.Index(keyBlock, "-----\n")
-		if endMarker == -1 {
-			endMarker = strings.Index(keyBlock, "-----")
-		}
-		if endMarker != -1 {
-			// END 마커까지 포함하여 추출
-			endMarkerEnd := strings.Index(keyBlock[endMarker:], "\n")
-			if endMarkerEnd != -1 {
-				keyBlock = keyBlock[:endMarker+endMarkerEnd]
-			} else {
-				keyBlock = keyBlock[:endMarker+5] // "-----" 길이
-			}
-		}
-
-		// 마지막 정리
-		keyBlock = strings.TrimSpace(keyBlock)
-		if !strings.HasSuffix(keyBlock, "-----") {
-			if strings.Contains(keyBlock, "OPENSSH PRIVATE KEY") {
-				keyBlock += "\n-----END OPENSSH PRIVATE KEY-----"
-			} else if strings.Contains(keyBlock, "RSA PRIVATE KEY") {
-				keyBlock += "\n-----END RSA PRIVATE KEY-----"
-			} else if strings.Contains(keyBlock, "EC PRIVATE KEY") {
-				keyBlock += "\n-----END EC PRIVATE KEY-----"
-			}
-		}
-
-		return keyBlock
+	if err := tarWriter.Close(); err != nil {
+		return nil, fmt.Errorf("tar 완료 실패: %v", err)
 	}
 
-	return cleanKey
+	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+}
+
+// addFileToTar는 파일을 tar 아카이브에 추가합니다
+func (c *Client) addFileToTar(tarWriter *tar.Writer, filePath, name string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	header := &tar.Header{
+		Name: name,
+		Size: info.Size(),
+		Mode: int64(info.Mode()),
+	}
+
+	if err := tarWriter.WriteHeader(header); err != nil {
+		return err
+	}
+
+	_, err = io.Copy(tarWriter, file)
+	return err
+}
+
+// stringPtr은 문자열 포인터를 반환하는 헬퍼 함수입니다
+func stringPtr(s string) *string {
+	return &s
 }

@@ -440,6 +440,8 @@ test_ssh_connection() {
     local session_id=$(echo "$result" | jq -r '.session_id' 2>/dev/null)
     local ssh_host=$(echo "$result" | jq -r '.ssh_host' 2>/dev/null)
     local ssh_port=$(echo "$result" | jq -r '.ssh_port' 2>/dev/null)
+    local ssh_user=$(echo "$result" | jq -r '.ssh_user' 2>/dev/null)
+    local ssh_private_key=$(echo "$result" | jq -r '.ssh_private_key' 2>/dev/null)
     
     if [ "$session_id" = "null" ] || [ "$session_id" = "" ]; then
         error "세션 ID를 파싱할 수 없습니다"
@@ -450,13 +452,21 @@ test_ssh_connection() {
     CREATED_SESSIONS+=("$session_id")
     
     info "SSH 테스트용 세션 생성됨: $session_id"
-    info "SSH 접속 정보: $user_id@localhost:10022"
+    info "SSH 접속 정보: $ssh_user@$ssh_host:$ssh_port"
     
-    # 세션 상세 정보 조회하여 SSH 비밀번호 획득
+    # SSH 개인키 임시 파일 생성
+    local temp_key_file="/tmp/integration_test_ssh_key_$$"
+    echo "$ssh_private_key" > "$temp_key_file"
+    chmod 600 "$temp_key_file"
+    
+    info "SSH 개인키 임시 파일 생성: $temp_key_file"
+    
+    # 세션 상세 정보 조회하여 SSH 비밀번호 획득 (fallback용)
     local session_info
     session_info=$(http_get "/sessions/$session_id")
     if [ $? -ne 0 ]; then
         error "세션 정보 조회 실패: $session_info"
+        rm -f "$temp_key_file"
         return
     fi
     
@@ -471,46 +481,54 @@ test_ssh_connection() {
         ssh_password=$(echo "$session_info" | jq -r '.metadata.ssh_password' 2>/dev/null)
     fi
     
-    info "SSH 비밀번호 확인됨"
-    
     # SSH 접속 테스트 (포트 접근 가능성만 확인)
     info "SSH 포트 접근성 테스트 중..."
-    if timeout 10 bash -c "echo > /dev/tcp/localhost/10022" 2>/dev/null; then
-        success "SSH 포트(10022) 접근 가능"
+    if timeout 10 bash -c "echo > /dev/tcp/$ssh_host/$ssh_port" 2>/dev/null; then
+        success "SSH 포트($ssh_port) 접근 가능"
     else
-        error "SSH 포트(10022) 접근 불가 - SSHPiper가 실행 중인지 확인하세요"
+        error "SSH 포트($ssh_port) 접근 불가 - SSHPiper가 실행 중인지 확인하세요"
+        rm -f "$temp_key_file"
         return
     fi
     
-    # 실제 SSH 연결 테스트 (sshpass 사용 가능한 경우)
-    if command -v sshpass > /dev/null; then
-        info "sshpass를 사용한 SSH 연결 테스트 중..."
-        
-        # SSH 연결 테스트 (간단한 명령 실행)
-        local ssh_result
-        ssh_result=$(timeout 15 sshpass -p "$ssh_password" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 "$user_id@localhost" -p 10022 "echo 'SSH 연결 성공'" 2>/dev/null)
-        
-        if [ $? -eq 0 ] && echo "$ssh_result" | grep -q "SSH 연결 성공"; then
-            success "SSH 연결 및 명령 실행 성공"
-        else
-            warning "SSH 연결 테스트 실패 - 컨테이너가 아직 완전히 준비되지 않았을 수 있습니다"
-            info "수동 테스트: sshpass -p '$ssh_password' ssh $user_id@localhost -p 10022"
-        fi
+    # SSH 키 인증 테스트
+    info "SSH 키 인증 테스트 중..."
+    local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
+    local ssh_result
+    ssh_result=$(timeout 15 ssh $ssh_opts -i "$temp_key_file" -p $ssh_port "$ssh_user@$ssh_host" "echo 'SSH 키 인증 성공'" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && echo "$ssh_result" | grep -q "SSH 키 인증 성공"; then
+        success "SSH 키 인증 및 명령 실행 성공"
     else
-        warning "sshpass가 설치되지 않아 실제 SSH 연결 테스트를 건너뜁니다"
-        info "설치 방법: apt-get install sshpass"
-        info "수동 테스트: ssh $user_id@localhost -p 10022 (비밀번호: 세션 메타데이터 참조)"
+        warning "SSH 키 인증 실패, 비밀번호 인증 시도 중..."
+        
+        # 비밀번호 인증 테스트 (fallback)
+        if command -v sshpass > /dev/null && [ "$ssh_password" != "null" ] && [ -n "$ssh_password" ]; then
+            info "sshpass를 사용한 SSH 연결 테스트 중..."
+            
+            ssh_result=$(timeout 15 sshpass -p "$ssh_password" ssh $ssh_opts -p $ssh_port "$ssh_user@$ssh_host" "echo 'SSH 비밀번호 인증 성공'" 2>/dev/null)
+            
+            if [ $? -eq 0 ] && echo "$ssh_result" | grep -q "SSH 비밀번호 인증 성공"; then
+                success "SSH 비밀번호 인증 및 명령 실행 성공"
+            else
+                warning "SSH 비밀번호 인증도 실패 - 컨테이너가 아직 완전히 준비되지 않았을 수 있습니다"
+                info "수동 테스트: ssh -i $temp_key_file -p $ssh_port $ssh_user@$ssh_host"
+            fi
+        else
+            warning "sshpass가 설치되지 않아 비밀번호 인증 테스트를 건너뜁니다"
+            info "설치 방법: apt-get install sshpass"
+            info "수동 테스트: ssh -i $temp_key_file -p $ssh_port $ssh_user@$ssh_host"
+        fi
     fi
+    
+    # 임시 키 파일 정리
+    rm -f "$temp_key_file"
+    info "임시 SSH 키 파일 삭제됨"
 }
 
 # SSH 기능 테스트
 test_ssh_functionality() {
     section "SSH 기능 테스트"
-    
-    if ! command -v sshpass > /dev/null; then
-        warning "sshpass가 없어 SSH 기능 테스트를 건너뜁니다"
-        return
-    fi
     
     # 기존 세션이 있는지 확인
     if [ ${#CREATED_SESSIONS[@]} -eq 0 ]; then
@@ -530,22 +548,34 @@ test_ssh_functionality() {
     
     local user_id=$(echo "$session_info" | jq -r '.user_id' 2>/dev/null)
     local ssh_password=$(echo "$session_info" | jq -r '.metadata.ssh_password' 2>/dev/null)
+    local ssh_port=$(echo "$session_info" | jq -r '.metadata.ssh_port' 2>/dev/null)
     local gpu_uuid=$(echo "$session_info" | jq -r '.gpu_uuid' 2>/dev/null)
     
-    if [ "$user_id" = "null" ] || [ "$ssh_password" = "null" ]; then
+    if [ "$user_id" = "null" ] || [ "$ssh_port" = "null" ]; then
         error "SSH 기능 테스트를 위한 세션 정보가 불완전합니다"
         return
     fi
     
-    info "SSH 기능 테스트 시작: $user_id"
+    info "SSH 기능 테스트 시작: $user_id (포트: $ssh_port)"
     
     # SSH 연결을 위한 공통 옵션
     local ssh_opts="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes"
     
+    # 비밀번호 인증을 사용한 테스트 (sshpass 필요)
+    if ! command -v sshpass > /dev/null; then
+        warning "sshpass가 없어 SSH 기능 테스트를 건너뜁니다"
+        return
+    fi
+    
+    if [ "$ssh_password" = "null" ] || [ -z "$ssh_password" ]; then
+        warning "SSH 비밀번호가 없어 SSH 기능 테스트를 건너뜁니다"
+        return
+    fi
+    
     # 1. 기본 명령 실행 테스트
     info "기본 명령 실행 테스트..."
     local hostname_result
-    hostname_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p 10022 "hostname" 2>/dev/null)
+    hostname_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p $ssh_port "hostname" 2>/dev/null)
     if [ $? -eq 0 ] && [ -n "$hostname_result" ]; then
         success "기본 명령 실행 성공 (hostname: $hostname_result)"
     else
@@ -555,7 +585,7 @@ test_ssh_functionality() {
     # 2. GPU 접근 테스트
     info "GPU 접근 테스트..."
     local gpu_test_result
-    gpu_test_result=$(timeout 15 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p 10022 "nvidia-smi -L 2>/dev/null | head -1" 2>/dev/null)
+    gpu_test_result=$(timeout 15 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p $ssh_port "nvidia-smi -L 2>/dev/null | head -1" 2>/dev/null)
     if [ $? -eq 0 ] && echo "$gpu_test_result" | grep -q "GPU"; then
         success "GPU 접근 성공: $gpu_test_result"
     else
@@ -565,7 +595,7 @@ test_ssh_functionality() {
     # 3. 워크스페이스 접근 테스트
     info "워크스페이스 접근 테스트..."
     local workspace_result
-    workspace_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p 10022 "ls -la /workspace && echo 'workspace_ok'" 2>/dev/null)
+    workspace_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p $ssh_port "ls -la /workspace && echo 'workspace_ok'" 2>/dev/null)
     if [ $? -eq 0 ] && echo "$workspace_result" | grep -q "workspace_ok"; then
         success "워크스페이스 접근 성공"
     else
@@ -575,7 +605,7 @@ test_ssh_functionality() {
     # 4. 파일 생성/삭제 테스트
     info "파일 시스템 권한 테스트..."
     local file_test_result
-    file_test_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p 10022 "echo 'test' > /workspace/test.txt && cat /workspace/test.txt && rm /workspace/test.txt && echo 'file_test_ok'" 2>/dev/null)
+    file_test_result=$(timeout 10 sshpass -p "$ssh_password" ssh $ssh_opts "$user_id@localhost" -p $ssh_port "echo 'test' > /workspace/test.txt && cat /workspace/test.txt && rm /workspace/test.txt && echo 'file_test_ok'" 2>/dev/null)
     if [ $? -eq 0 ] && echo "$file_test_result" | grep -q "file_test_ok"; then
         success "파일 시스템 권한 테스트 성공"
     else

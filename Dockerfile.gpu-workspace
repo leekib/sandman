@@ -29,6 +29,11 @@
         sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config && \
         sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config
     
+    # start.sh 스크립트 복사 및 실행 권한 설정
+    COPY start.sh /start.sh
+    RUN chmod +x /start.sh
+    
     EXPOSE 22
-    CMD ["/usr/sbin/sshd","-D"]
+    CMD ["/start.sh"]
+
     
