@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sandman/gpu-ssh-gateway/internal/gpu"
 	"github.com/sandman/gpu-ssh-gateway/internal/session"
+	"github.com/sandman/gpu-ssh-gateway/internal/store"
 )
 
 type Server struct {
@@ -20,10 +21,43 @@ func NewServer(sessionService *session.Service, gpuManager *gpu.Manager) *Server
 	}
 }
 
+// CORS 미들웨어 - 최대한 허용
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 모든 오리진 허용
+		c.Header("Access-Control-Allow-Origin", "*")
+
+		// 모든 HTTP 메서드 허용
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+
+		// 모든 헤더 허용
+		c.Header("Access-Control-Allow-Headers", "*")
+
+		// 인증 정보 허용
+		c.Header("Access-Control-Allow-Credentials", "true")
+
+		// Preflight 요청에 대한 최대 캐시 시간 (24시간)
+		c.Header("Access-Control-Max-Age", "86400")
+
+		// 클라이언트가 접근할 수 있는 응답 헤더
+		c.Header("Access-Control-Expose-Headers", "*")
+
+		// OPTIONS 요청 (preflight)에 대한 처리
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+
+		c.Next()
+	}
+}
+
 func (s *Server) SetupRoutes() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Logger(), gin.Recovery())
+
+	// 미들웨어 추가: 로거, 복구, CORS
+	r.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
 
 	// Health check
 	r.GET("/healthz", s.healthCheck)
@@ -106,6 +140,11 @@ func (s *Server) listSessions(c *gin.Context) {
 			"error": "세션 목록 조회 실패: " + err.Error(),
 		})
 		return
+	}
+
+	// sessions가 nil인 경우 빈 슬라이스로 초기화
+	if sessions == nil {
+		sessions = []*store.Session{}
 	}
 
 	c.JSON(http.StatusOK, sessions)

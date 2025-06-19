@@ -71,6 +71,37 @@ docker-compose up -d
 
 ## 📖 API 엔드포인트
 
+### 🌐 CORS 설정
+
+이 API는 **모든 오리진에서의 접근을 허용**하도록 설정되어 있습니다:
+
+- **모든 도메인**: `Access-Control-Allow-Origin: *`
+- **모든 HTTP 메서드**: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`
+- **모든 헤더**: 커스텀 헤더 포함 모든 요청 헤더 허용
+- **인증 정보**: `credentials` 포함 요청 지원
+- **Preflight 캐시**: 24시간 캐싱으로 성능 최적화
+
+**웹 브라우저에서 직접 호출 가능:**
+```javascript
+// JavaScript에서 직접 API 호출 가능
+fetch('http://localhost:8080/sessions', {
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Custom-Header': 'value'  // 커스텀 헤더도 허용
+  },
+  credentials: 'include',  // 쿠키/인증 정보 포함
+  body: JSON.stringify({
+    user_id: 'user123',
+    ttl_minutes: 60
+  })
+})
+.then(response => response.json())
+.then(data => console.log(data));
+```
+
+---
+
 ### 🔍 시스템 상태
 
 #### 헬스체크
@@ -121,6 +152,13 @@ Content-Type: application/json
 }
 ```
 
+**에러 응답 예시:**
+```json
+{
+  "error": "잘못된 요청 형식: Key: 'CreateRequest.UserID' Error:Field validation for 'UserID' failed on the 'required' tag"
+}
+```
+
 **사용 예시:**
 ```bash
 # 기본 세션 생성
@@ -143,7 +181,7 @@ curl -X POST http://localhost:8080/sessions \
 
 #### 2. 특정 세션 조회
 ```bash
-GET /sessions/{session_id}
+GET /sessions/{id}
 ```
 
 **응답 (200 OK):**
@@ -162,8 +200,16 @@ GET /sessions/{session_id}
   "metadata": {
     "image": "gpu-workspace",
     "workspace": "/srv/workspaces/user123",
+    "ssh_password": "auto-generated-password",
     "ssh_port": "10001"
   }
+}
+```
+
+**에러 응답 (404 Not Found):**
+```json
+{
+  "error": "세션을 찾을 수 없습니다: sql: no rows in result set"
 }
 ```
 
@@ -188,19 +234,15 @@ GET /sessions
     "ssh_port": 10001,
     "gpu_uuid": "MIG-GPU-3e9c9c52/3/0",
     "mig_profile": "3g.20gb",
+    "ttl_minutes": 60,
     "created_at": "2025-01-17T08:00:00Z",
-    "expires_at": "2025-01-17T09:00:00Z"
-  },
-  {
-    "id": "session-2",
-    "user_id": "user456",
-    "container_id": "container_456",
-    "container_ip": "172.20.0.11",
-    "ssh_port": 10002,
-    "gpu_uuid": "MIG-GPU-3e9c9c52/1/0",
-    "mig_profile": "1g.10gb",
-    "created_at": "2025-01-17T08:15:00Z",
-    "expires_at": "2025-01-17T09:15:00Z"
+    "expires_at": "2025-01-17T09:00:00Z",
+    "metadata": {
+      "image": "gpu-workspace",
+      "workspace": "/srv/workspaces/user123",
+      "ssh_password": "auto-generated-password",
+      "ssh_port": "10001"
+    }
   }
 ]
 ```
@@ -212,13 +254,20 @@ curl http://localhost:8080/sessions
 
 #### 4. 특정 세션 삭제
 ```bash
-DELETE /sessions/{session_id}
+DELETE /sessions/{id}
 ```
 
 **응답 (200 OK):**
 ```json
 {
   "message": "세션이 성공적으로 삭제되었습니다"
+}
+```
+
+**에러 응답 (500 Internal Server Error):**
+```json
+{
+  "error": "세션 삭제 실패: [에러 메시지]"
 }
 ```
 
@@ -236,6 +285,13 @@ DELETE /sessions
 ```json
 {
   "message": "모든 세션이 성공적으로 삭제되었습니다"
+}
+```
+
+**에러 응답 (500 Internal Server Error):**
+```json
+{
+  "error": "모든 세션 삭제 실패: [에러 메시지]"
 }
 ```
 
@@ -407,18 +463,21 @@ curl http://localhost:8080/gpus/available
 ### 💡 API 사용 팁
 
 1. **세션 생성 시 주의사항:**
-   - `user_id`는 고유해야 하며, 기존 활성 세션이 있으면 생성 실패
-   - `mig_profile`과 `mig_instance_uuid` 중 하나만 지정
+   - `user_id`는 고유해야 하며, 기존 활성 세션이 있으면 생성 실패 (`"사용자 [user_id]의 세션이 이미 존재합니다"`)
+   - `mig_profile`과 `mig_instance_uuid` 중 하나만 지정 가능
    - 사용 가능한 GPU 리소스가 없으면 생성 실패
    - 포트는 10000-20000 범위에서 자동 할당됨
+   - SSH 개인키와 패스워드 모두 응답에 포함됨 (보안 목적으로 개인키 사용 권장)
 
-2. **SSH 접속:**
+2. **SSH 접속 옵션:**
    ```bash
-   # 기본 접속 (비밀번호 인증)
+   # 패스워드 인증 (비추천)
    ssh user123@localhost -p 10001
    
-   # 키 기반 접속 (응답의 private_key 사용)
-   ssh -i private_key user123@localhost -p 10001
+   # 키 기반 접속 (추천)
+   echo "[응답의 ssh_private_key]" > /tmp/key.pem
+   chmod 600 /tmp/key.pem
+   ssh -i /tmp/key.pem user123@localhost -p 10001
    ```
 
 3. **세션 모니터링:**
@@ -428,16 +487,44 @@ curl http://localhost:8080/gpus/available
    
    # 특정 사용자 세션 확인
    curl -s http://localhost:8080/sessions | jq '.[] | select(.user_id=="user123")'
+   
+   # 만료 임박 세션 확인
+   curl -s http://localhost:8080/sessions | jq '.[] | select(.expires_at < (now + 300 | strftime("%Y-%m-%dT%H:%M:%SZ")))'
    ```
 
 4. **리소스 정리:**
    ```bash
-   # 만료된 세션은 자동으로 정리되지만, 수동 정리도 가능
+   # 특정 세션 정리
    curl -X DELETE http://localhost:8080/sessions/{session_id}
    
    # 긴급시 모든 세션 정리
    curl -X DELETE http://localhost:8080/sessions
    ```
+
+5. **GPU 리소스 확인:**
+   ```bash
+   # 전체 GPU 상태
+   curl -s http://localhost:8080/gpus | jq '.gpus[] | {name: .name, utilization: .utilization, memory_used: .memory_used}'
+   
+   # 사용 가능한 MIG 인스턴스
+   curl -s http://localhost:8080/gpus/available | jq '.available_instances[] | {uuid: .uuid, profile: .profile}'
+   ```
+
+### 🚨 일반적인 에러 해결
+
+1. **세션 생성 실패:**
+   - `"사용자 [user_id]의 세션이 이미 존재합니다"`: 기존 세션을 먼저 삭제하거나 다른 user_id 사용
+   - `"GPU 할당 실패"`: 사용 가능한 GPU 인스턴스 확인 (`/gpus/available`)
+   - `"컨테이너 생성 실패"`: Docker 데몬 상태 및 이미지 존재 여부 확인
+
+2. **SSH 접속 실패:**
+   - 포트 접근 불가: 방화벽 설정 확인
+   - 인증 실패: SSH 키 파일 권한 (600) 및 형식 확인
+   - 컨테이너 미준비: 세션 생성 후 1-2분 대기
+
+3. **리소스 부족:**
+   - MIG 인스턴스 부족: 더 작은 프로파일 사용하거나 기존 세션 정리
+   - 포트 부족: 기존 세션 정리 또는 포트 범위 확장
 
 ## 🎮 지원되는 MIG 프로파일
 

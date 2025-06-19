@@ -185,6 +185,10 @@ func (s *SQLiteStore) ListExpiredSessions() ([]*Session, error) {
 		sessions = append(sessions, session)
 	}
 
+	if sessions == nil {
+		sessions = []*Session{}
+	}
+
 	return sessions, nil
 }
 
@@ -216,6 +220,10 @@ func (s *SQLiteStore) ListAllSessions() ([]*Session, error) {
 
 		json.Unmarshal([]byte(metadataJSON), &session.Metadata)
 		sessions = append(sessions, session)
+	}
+
+	if sessions == nil {
+		sessions = []*Session{}
 	}
 
 	return sessions, nil

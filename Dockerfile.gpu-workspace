@@ -5,7 +5,7 @@
     ARG USERNAME=user
     ARG UID=1001
     ARG GID=1001
-    ARG PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJkhYlvA41Rka3VfOQi2ZM4ZEb7Za7I+hYUZA9V3pwZ9 leekib@sandbox"
+    ARG PUBKEY=""
     
     # 기본 패키지 설치
     RUN apt-get update && \
